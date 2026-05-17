@@ -31,6 +31,34 @@ public partial class PowerPointHandler
         path = ResolveIdPath(path);
         path = ResolveLastPredicates(path);
 
+        // /slide[*] — remove every slide. Used by `dump` to clear a non-empty
+        // target before replaying slide content, so round-trip replay onto an
+        // already-populated deck does not double the slide count. No-op when
+        // the deck is empty (clean replay case).
+        if (path == "/slide[*]")
+        {
+            var presentationPart0 = _doc.PresentationPart
+                ?? throw new InvalidOperationException("Presentation not found");
+            var presentation0 = presentationPart0.Presentation
+                ?? throw new InvalidOperationException("No presentation");
+            var slideIdList0 = presentation0.GetFirstChild<SlideIdList>();
+            if (slideIdList0 != null)
+            {
+                foreach (var sid in slideIdList0.Elements<SlideId>().ToList())
+                {
+                    var rid = sid.RelationshipId?.Value;
+                    sid.Remove();
+                    if (rid != null)
+                    {
+                        try { presentationPart0.DeletePart(presentationPart0.GetPartById(rid)); }
+                        catch { /* part already gone */ }
+                    }
+                }
+                presentation0.Save();
+            }
+            return null;
+        }
+
         // BUG-R36-B11: /slide[N]/comment[M] removal.
         var cmtRemoveMatch = Regex.Match(path, @"^/slide\[(\d+)\]/comment\[(\d+)\]$");
         if (cmtRemoveMatch.Success)

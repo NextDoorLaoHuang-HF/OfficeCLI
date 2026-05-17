@@ -45,6 +45,15 @@ public static partial class PptxBatchEmitter
         var items = new List<BatchItem>();
         var ctx = new SlideEmitContext(new List<UnsupportedWarning>());
 
+        // Clear the target deck's slides FIRST so replay onto a non-empty
+        // target lands on a clean slate. Without this, `add slide` items
+        // append after existing slides while every `add shape parent=/slide[N]`
+        // path still resolves to the original slide[N] — the target ends up
+        // with 2× the slide count (existing + freshly added empties) on each
+        // round-trip. `remove /slide[*]` is a no-op on a deck with 0 slides,
+        // so this is safe for the clean-target case too.
+        items.Add(new BatchItem { Command = "remove", Path = "/slide[*]" });
+
         // Resource parts FIRST — theme, notesMaster, masters, layouts.
         // Order matters: replay's raw-set must overwrite the blank deck's
         // seeded baseline before slide content is added so per-slide
