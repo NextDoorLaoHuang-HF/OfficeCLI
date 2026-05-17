@@ -1630,9 +1630,11 @@ public partial class PowerPointHandler
         }
         var solidFill = ln?.GetFirstChild<Drawing.SolidFill>();
         var rgb = solidFill?.GetFirstChild<Drawing.RgbColorModelHex>();
-        if (rgb?.Val?.HasValue == true)
-            // CONSISTENCY(canonical-key): canonical 'color'; 'lineColor' was legacy key.
-            node.Format["color"] = ParseHelpers.FormatHexColor(rgb.Val.Value!);
+        // CONSISTENCY(canonical-key): canonical 'color'; 'lineColor' was legacy.
+        // Use ReadColorFromFill so scheme-color line= (accent1, dark1, …) round-trips
+        // through Get; the prior rgb-only branch silently dropped a:schemeClr.
+        var cxnColor = ReadColorFromFill(solidFill);
+        if (cxnColor != null) node.Format["color"] = cxnColor;
 
         // Line opacity
         var cxnColorEl = rgb as OpenXmlElement ?? solidFill?.GetFirstChild<Drawing.SchemeColor>();

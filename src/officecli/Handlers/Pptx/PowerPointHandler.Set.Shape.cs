@@ -402,7 +402,6 @@ public partial class PowerPointHandler
                     var (lineColorPart, lineWidthPart, lineDashPart) = SplitCompoundLineValue(value);
                     var spPr = cxn.ShapeProperties ?? (cxn.ShapeProperties = new ShapeProperties());
                     var outline = EnsureOutline(spPr);
-                    var (rgb, _) = ParseHelpers.SanitizeColorForOoxml(lineColorPart);
                     outline.RemoveAllChildren<Drawing.SolidFill>();
                     if (lineWidthPart != null)
                         outline.Width = Core.EmuConverter.ParseLineWidth(lineWidthPart);
@@ -411,8 +410,12 @@ public partial class PowerPointHandler
                         outline.RemoveAllChildren<Drawing.PresetDash>();
                         outline.AppendChild(new Drawing.PresetDash { Val = ParseLineDashValue(lineDashPart) });
                     }
-                    var newFill = new Drawing.SolidFill(
-                        new Drawing.RgbColorModelHex { Val = rgb });
+                    // CONSISTENCY(color-input-scheme): shape line= already routes
+                    // through BuildSolidFill which accepts scheme names (accent1,
+                    // dark1, …) and hex equally; mirror the same surface here so
+                    // a connector accepts the documented vocabulary instead of
+                    // rejecting scheme colors at SanitizeColorForOoxml.
+                    var newFill = BuildSolidFill(lineColorPart);
                     // CT_LineProperties schema: fill → prstDash → ... → headEnd → tailEnd
                     var prstDash = outline.GetFirstChild<Drawing.PresetDash>();
                     if (prstDash != null)
