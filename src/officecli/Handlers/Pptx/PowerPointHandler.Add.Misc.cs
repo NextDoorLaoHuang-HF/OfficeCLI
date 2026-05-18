@@ -845,6 +845,17 @@ public partial class PowerPointHandler
                 if (properties.TryGetValue("delay", out var rawDelay))
                     ValidateAnimationDelay(rawDelay);
 
+                // L2 props (repeat, restart, autoReverse) — validate up front
+                // for a hard error rather than relying on the composite parser
+                // (which silently ignores unknown key=value segments).
+                if (properties.TryGetValue("repeat", out var rawRepeat))
+                    ValidateAnimationRepeat(rawRepeat);
+                if (properties.TryGetValue("restart", out var rawRestart))
+                    ValidateAnimationRestart(rawRestart);
+                if (properties.TryGetValue("autoReverse", out var rawAutoRev)
+                    || properties.TryGetValue("autoreverse", out rawAutoRev))
+                    ValidateAnimationAutoReverse(rawAutoRev);
+
                 // Map trigger property to animation format
                 var triggerPart = trigger.ToLowerInvariant() switch
                 {
@@ -867,6 +878,13 @@ public partial class PowerPointHandler
                     animValue += $"-easing={easing}";
                 if (properties.TryGetValue("direction", out var dir))
                     animValue += $"-{dir}";
+                if (properties.TryGetValue("repeat", out var repProp))
+                    animValue += $"-repeat={repProp}";
+                if (properties.TryGetValue("restart", out var restartProp))
+                    animValue += $"-restart={restartProp}";
+                if (properties.TryGetValue("autoReverse", out var arProp)
+                    || properties.TryGetValue("autoreverse", out arProp))
+                    animValue += $"-autoReverse={arProp}";
 
                 ApplyShapeAnimation(animSlidePart, animShape, animValue);
                 GetSlide(animSlidePart).Save();

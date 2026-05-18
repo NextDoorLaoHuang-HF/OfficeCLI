@@ -1915,6 +1915,32 @@ public partial class PowerPointHandler
         if (effectCTn.Deceleration?.HasValue == true && effectCTn.Deceleration.Value > 0)
             animNode.Format["easeout"] = (int)(effectCTn.Deceleration.Value / 1000);
 
+        // L2 props: emit only when the underlying cTn attribute is present.
+        // OOXML repeatCount is 1000ths-of-a-count or the literal "indefinite";
+        // canonical readback is the plain integer count or "indefinite".
+        var rcRaw = effectCTn.RepeatCount?.Value;
+        if (!string.IsNullOrEmpty(rcRaw))
+        {
+            if (rcRaw.Equals("indefinite", StringComparison.OrdinalIgnoreCase))
+                animNode.Format["repeat"] = "indefinite";
+            else if (int.TryParse(rcRaw, System.Globalization.NumberStyles.Integer,
+                         System.Globalization.CultureInfo.InvariantCulture, out var rcMilli)
+                     && rcMilli >= 1000)
+                animNode.Format["repeat"] = rcMilli / 1000;
+        }
+        var restartVal = effectCTn.Restart?.Value;
+        if (restartVal != null)
+        {
+            // Round-trip canonical enum spelling rather than the SDK ToString().
+            string? canon = null;
+            if (restartVal == TimeNodeRestartValues.Always) canon = "always";
+            else if (restartVal == TimeNodeRestartValues.WhenNotActive) canon = "whenNotActive";
+            else if (restartVal == TimeNodeRestartValues.Never) canon = "never";
+            if (canon != null) animNode.Format["restart"] = canon;
+        }
+        if (effectCTn.AutoReverse?.Value == true)
+            animNode.Format["autoReverse"] = true;
+
         // Delay (stored on midCTn start condition)
         CommonTimeNode? midCTn = null;
         var cur = effectCTn.Parent;

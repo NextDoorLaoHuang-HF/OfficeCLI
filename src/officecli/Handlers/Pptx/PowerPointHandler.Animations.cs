@@ -4,6 +4,7 @@
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Presentation;
+using OfficeCli.Core;
 using Drawing = DocumentFormat.OpenXml.Drawing;
 
 namespace OfficeCli.Handlers;
@@ -45,6 +46,66 @@ public partial class PowerPointHandler
                 System.Globalization.CultureInfo.InvariantCulture, out var ms) || ms < 0)
             throw new ArgumentException(
                 $"Invalid animation delay: '{delay}' (expected a non-negative integer in milliseconds, e.g. delay=200).");
+    }
+
+    // L2 props (repeat / restart / autoReverse). OOXML cTn attributes are
+    // @repeatCount (ST_TLTimeNodeRepeatCountVal, integer * 1000 or "indefinite"),
+    // @restart (always | whenNotActive | never), @autoRev (xsd:boolean).
+    internal static void ValidateAnimationRepeat(string? repeat)
+    {
+        if (string.IsNullOrEmpty(repeat)) return;
+        var trimmed = repeat.Trim();
+        if (trimmed.Equals("indefinite", StringComparison.OrdinalIgnoreCase)) return;
+        if (!int.TryParse(trimmed, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var n) || n < 1)
+            throw new ArgumentException(
+                $"Invalid animation repeat: '{repeat}' (expected a positive integer count, e.g. repeat=3, or the literal 'indefinite').");
+    }
+
+    private static readonly HashSet<string> _animRestartValues =
+        new(StringComparer.OrdinalIgnoreCase) { "always", "whenNotActive", "never" };
+
+    internal static void ValidateAnimationRestart(string? restart)
+    {
+        if (string.IsNullOrEmpty(restart)) return;
+        if (!_animRestartValues.Contains(restart.Trim()))
+            throw new ArgumentException(
+                $"Invalid animation restart: '{restart}'. Valid values: always, whenNotActive, never.");
+    }
+
+    internal static void ValidateAnimationAutoReverse(string? autoReverse)
+    {
+        if (string.IsNullOrEmpty(autoReverse)) return;
+        // IsTruthy throws on garbage. Round-trip through it so we share
+        // the project's canonical bool grammar (true/false/1/0/yes/no/on/off).
+        _ = ParseHelpers.IsTruthy(autoReverse);
+    }
+
+    // Canonicalize a restart input string to the matching enum value. Returns
+    // null when not present (caller leaves the cTn attribute unset).
+    private static TimeNodeRestartValues? ParseAnimRestart(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return null;
+        var t = value.Trim();
+        if (t.Equals("always", StringComparison.OrdinalIgnoreCase))
+            return TimeNodeRestartValues.Always;
+        if (t.Equals("whenNotActive", StringComparison.OrdinalIgnoreCase))
+            return TimeNodeRestartValues.WhenNotActive;
+        if (t.Equals("never", StringComparison.OrdinalIgnoreCase))
+            return TimeNodeRestartValues.Never;
+        return null;
+    }
+
+    // OOXML repeatCount uses 1000ths of a count: repeat=3 → "3000".
+    private static string? FormatAnimRepeatOoxml(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return null;
+        var t = value.Trim();
+        if (t.Equals("indefinite", StringComparison.OrdinalIgnoreCase)) return "indefinite";
+        if (int.TryParse(t, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var n) && n >= 1)
+            return (n * 1000).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return null;
     }
 
     // ==================== Slide Transitions ====================
@@ -456,6 +517,10 @@ public partial class PowerPointHandler
         string? direction = null;
         AnimTrigger? explicitTrigger = null;
         int delayMs = 0, easingAccel = 0, easingDecel = 0;
+        // L2 props (set on the effect cTn via @repeatCount / @restart / @autoRev).
+        string? repeatRaw = null;
+        string? restartRaw = null;
+        bool? autoReverse = null;
         var unrecognized = new List<string>();
 
         // bt-1 / fuzz-1 fix: top-level animation= prop bypasses the
@@ -498,12 +563,29 @@ public partial class PowerPointHandler
             else if (seg is "left" or "l" or "right" or "r" or "up" or "top" or "u"
                      or "down" or "bottom" or "d")
                 direction = seg;
-            // key=value (delay, easing, easein, easeout)?
+            // key=value (delay, easing, easein, easeout, repeat, restart, autoreverse)?
             else if (seg.Contains('='))
             {
                 var eqIdx = seg.IndexOf('=');
                 var kKey = seg[..eqIdx];
-                if (int.TryParse(seg[(eqIdx + 1)..], out var kVal))
+                var kRaw = seg[(eqIdx + 1)..];
+                // String-valued L2 props (preserve case from the original
+                // value string — `seg` was lowered but we want canonical
+                // enum spelling for restart and the literal "indefinite"
+                // for repeat). Re-extract from the un-lowered `parts`.
+                if (kKey is "repeat" or "restart" or "autoreverse")
+                {
+                    var origSeg = parts[i];
+                    var origEq = origSeg.IndexOf('=');
+                    var origRaw = origEq >= 0 ? origSeg[(origEq + 1)..] : kRaw;
+                    switch (kKey)
+                    {
+                        case "repeat": repeatRaw = origRaw; break;
+                        case "restart": restartRaw = origRaw; break;
+                        case "autoreverse": autoReverse = ParseHelpers.IsTruthy(origRaw); break;
+                    }
+                }
+                else if (int.TryParse(kRaw, out var kVal))
                 {
                     switch (kKey)
                     {
@@ -569,7 +651,8 @@ public partial class PowerPointHandler
         var clickGroup = BuildClickGroup(
             shapeId.ToString(), presetId, presetClass, nodeType,
             durationMs, filter, grpId, outerDelay, presetSubtype, ref nextId,
-            delayMs, easingAccel, easingDecel);
+            delayMs, easingAccel, easingDecel,
+            repeatRaw, restartRaw, autoReverse);
 
         if (trigger == AnimTrigger.WithPrevious)
         {
@@ -730,7 +813,10 @@ public partial class PowerPointHandler
         ref uint nextId,
         int delayMs = 0,
         int easingAccel = 0,
-        int easingDecel = 0)
+        int easingDecel = 0,
+        string? repeat = null,
+        string? restart = null,
+        bool? autoReverse = null)
     {
         var isEntrance = presetClass == TimeNodePresetClassValues.Entrance;
         var isEmphasis = presetClass == TimeNodePresetClassValues.Emphasis;
@@ -866,6 +952,14 @@ public partial class PowerPointHandler
             effectCTn.Duration = durationMs.ToString();
         if (easingAccel > 0) effectCTn.Acceleration = easingAccel;
         if (easingDecel > 0) effectCTn.Deceleration = easingDecel;
+        // L2 attributes on the effect cTn. repeat/restart/autoReverse all map
+        // 1:1 to OOXML cTn attributes (@repeatCount/@restart/@autoRev). We
+        // apply them only when supplied so the cTn stays minimal otherwise.
+        var repeatOoxml = FormatAnimRepeatOoxml(repeat);
+        if (repeatOoxml != null) effectCTn.RepeatCount = repeatOoxml;
+        var restartEnum = ParseAnimRestart(restart);
+        if (restartEnum != null) effectCTn.Restart = restartEnum.Value;
+        if (autoReverse.HasValue) effectCTn.AutoReverse = autoReverse.Value;
         var effectPar = new ParallelTimeNode { CommonTimeNode = effectCTn };
 
         // --- middle cTn (delay wrapper) ---

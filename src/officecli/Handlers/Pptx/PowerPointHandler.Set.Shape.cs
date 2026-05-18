@@ -837,6 +837,14 @@ public partial class PowerPointHandler
             ValidateAnimationDuration(setDurRaw2);
         if (properties.TryGetValue("delay", out var setDelayRaw))
             ValidateAnimationDelay(setDelayRaw);
+        // L2 props symmetric with AddAnimation.
+        if (properties.TryGetValue("repeat", out var setRepeatRaw))
+            ValidateAnimationRepeat(setRepeatRaw);
+        if (properties.TryGetValue("restart", out var setRestartRaw))
+            ValidateAnimationRestart(setRestartRaw);
+        if (properties.TryGetValue("autoReverse", out var setArRaw)
+            || properties.TryGetValue("autoreverse", out setArRaw))
+            ValidateAnimationAutoReverse(setArRaw);
         var duration = properties.TryGetValue("duration", out var dv) ? dv
             : properties.TryGetValue("dur", out var dv2) ? dv2
             : (existing.Format.TryGetValue("duration", out var ed) ? ed?.ToString() ?? "500" : "500");
@@ -864,6 +872,14 @@ public partial class PowerPointHandler
             animValue += $"-easing={easing}";
         if (properties.TryGetValue("direction", out var dir))
             animValue += $"-{dir}";
+        // L2: merge user override with existing Format readback so a partial
+        // Set (e.g. just repeat=5) preserves previously-stored restart/auto.
+        var repeatMerged = Resolve("repeat");
+        if (!string.IsNullOrEmpty(repeatMerged)) animValue += $"-repeat={repeatMerged}";
+        var restartMerged = Resolve("restart");
+        if (!string.IsNullOrEmpty(restartMerged)) animValue += $"-restart={restartMerged}";
+        var autoRevMerged = Resolve("autoReverse");
+        if (!string.IsNullOrEmpty(autoRevMerged)) animValue += $"-autoReverse={autoRevMerged}";
 
         var shapeId = shape.NonVisualShapeProperties?.NonVisualDrawingProperties?.Id?.Value;
         if (shapeId.HasValue)
