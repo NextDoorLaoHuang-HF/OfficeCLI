@@ -273,15 +273,16 @@ static partial class CommandBuilder
             // calls OutputFormatter.WrapEnvelope on any JSON-shaped stdout).
             // Capture PrintBatchResults output and apply the same envelope
             // here so callers see the same shape regardless of resident state.
-            // JSON Envelope contract: batch is a *mutation* command (root
-            // CLAUDE.md "Mutation: All requested ops rejected; partial success
-            // stays `true` with warnings"). Outer envelope.success is true
-            // when at least one step succeeded — per-step verdicts still
-            // ride on `data.results[].success`. Exit code stays in lockstep
-            // with envelope.success so CI gates and shells can rely on the
-            // single signal. Two `success` fields appear in the JSON (outer
-            // batch verdict, inner per-step) — disambiguate by JSON path.
-            var batchSuccess = batchResults.Count == 0 || batchResults.Any(r => r.Success);
+            // JSON Envelope contract: batch is a *judgment* command (root
+            // CLAUDE.md "Judgment: any batch step failed -> outer false").
+            // Outer envelope.success is true only when every step succeeded;
+            // a single failed step flips outer to false even if siblings
+            // succeeded. Per-step verdicts still ride on
+            // `data.results[].success`. Exit code stays in lockstep with
+            // envelope.success so CI gates and shells can rely on the single
+            // signal. Two `success` fields appear in the JSON (outer batch
+            // verdict, inner per-step) — disambiguate by JSON path.
+            var batchSuccess = batchResults.Count == 0 || !batchResults.Any(r => !r.Success);
             if (json)
             {
                 using var sw = new System.IO.StringWriter();

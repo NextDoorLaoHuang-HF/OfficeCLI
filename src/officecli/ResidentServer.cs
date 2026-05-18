@@ -939,12 +939,12 @@ public class ResidentServer : IDisposable
             }
         }
 
-        // Partial-success contract: batch is a mutation command (root
-        // CLAUDE.md "Mutation: partial success stays true"). The verdict
-        // flips to failure ONLY when every step was rejected (or the batch
-        // was empty). Keeps envelope.success / exit code in lockstep with
-        // the non-resident path.
-        _lastBatchHadFailure = results.Count > 0 && !results.Any(r => r.Success);
+        // Judgment contract: batch is classified as a judgment command (root
+        // CLAUDE.md "Judgment: any batch step failed -> outer false"). The
+        // verdict flips to failure as soon as ANY step is rejected. Keeps
+        // envelope.success / exit code in lockstep with the non-resident
+        // path.
+        _lastBatchHadFailure = results.Any(r => !r.Success);
         CommandBuilder.PrintBatchResults(results, json, items.Count);
     }
 
