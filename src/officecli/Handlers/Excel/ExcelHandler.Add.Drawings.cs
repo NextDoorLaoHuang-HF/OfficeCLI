@@ -486,6 +486,8 @@ public partial class ExcelHandler
                 }
                 else
                 {
+                    // CONSISTENCY(hyperlink-scheme-allowlist).
+                    Core.HyperlinkUriValidator.RequireSafeScheme(picHlink, "link");
                     var hlUri = new Uri(picHlink, UriKind.RelativeOrAbsolute);
                     var hlRel = picDrawingsPart.AddHyperlinkRelationship(hlUri, isExternal: true);
                     hlClick = new Drawing.HyperlinkOnClick { Id = hlRel.Id };

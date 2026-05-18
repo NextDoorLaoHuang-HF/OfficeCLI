@@ -463,6 +463,9 @@ public partial class WordHandler
                 hlUri = new Uri(hlUrl!, UriKind.Relative);
             else if (!Uri.TryCreate(hlUrl, UriKind.Absolute, out hlUri))
                 throw new ArgumentException($"Invalid hyperlink URL '{hlUrl}'. Expected a valid absolute URI (e.g. 'https://example.com') or a fragment-only anchor (e.g. '#bookmark').");
+            // CONSISTENCY(hyperlink-scheme-allowlist): gate absolute URIs only.
+            if (!hlIsFragment)
+                Core.HyperlinkUriValidator.RequireSafeScheme(hlUrl!, "url");
             hlRelId = hostPart.AddHyperlinkRelationship(hlUri!, isExternal: !hlIsFragment).Id;
         }
 

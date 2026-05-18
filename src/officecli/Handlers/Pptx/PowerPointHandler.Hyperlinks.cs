@@ -93,6 +93,11 @@ public partial class PowerPointHandler
             throw new ArgumentException(
                 $"Invalid hyperlink URL '{url}'. Expected an absolute URI (e.g. 'https://example.com'), " +
                 $"'slide[N]', or a named action (firstslide/lastslide/nextslide/previousslide/endshow).");
+        // CONSISTENCY(hyperlink-scheme-allowlist): reject javascript:, file:,
+        // data:, vbscript:, … before they reach the relationships file.
+        // Mirrored in ExcelHandler.Set.cs cell link + WordHandler.Set.Element.cs
+        // run/hyperlink writers; ppaction:// URIs are accepted (allowlisted).
+        Core.HyperlinkUriValidator.RequireSafeScheme(url, "link");
         var extRel = slidePart.AddHyperlinkRelationship(uri, isExternal: true);
         return new HyperlinkTarget { Id = extRel.Id, IsExternal = true };
     }

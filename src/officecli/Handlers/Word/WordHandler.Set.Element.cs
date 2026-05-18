@@ -584,6 +584,11 @@ public partial class WordHandler
                         // BUG-DUMP27: fragment-only URIs (e.g. "#_ftn1") are internal-anchor
                         // hyperlinks; mark isExternal=false so .rels TargetMode is omitted.
                         var isAbs = Uri.TryCreate(value, UriKind.Absolute, out var absUri);
+                        // CONSISTENCY(hyperlink-scheme-allowlist): only gate
+                        // absolute URIs; fragment-only (#_ftn1) and other
+                        // relative refs are intra-document and stay open.
+                        if (isAbs)
+                            Core.HyperlinkUriValidator.RequireSafeScheme(value, key);
                         var uri = isAbs ? absUri! : new Uri(value, UriKind.Relative);
                         var isFragment = !string.IsNullOrEmpty(value) && value.StartsWith('#');
                         var newRelId = hostPart3.AddHyperlinkRelationship(uri, isExternal: !isFragment).Id;
@@ -832,6 +837,10 @@ public partial class WordHandler
                     // BUG-DUMP27: fragment-only URIs (e.g. "#_ftn1") are internal-anchor
                     // hyperlinks; mark isExternal=false so .rels TargetMode is omitted.
                     var isAbs = Uri.TryCreate(value, UriKind.Absolute, out var absUri);
+                    // CONSISTENCY(hyperlink-scheme-allowlist): only absolute
+                    // URIs are scheme-gated; fragment/relative stay open.
+                    if (isAbs)
+                        Core.HyperlinkUriValidator.RequireSafeScheme(value, k);
                     var uri = isAbs ? absUri! : new Uri(value, UriKind.Relative);
                     var isFragment = !string.IsNullOrEmpty(value) && value.StartsWith('#');
                     var newRelId = hostPartHl.AddHyperlinkRelationship(uri, isExternal: !isFragment).Id;

@@ -673,6 +673,12 @@ public partial class ExcelHandler
                         }
                         else
                         {
+                            // CONSISTENCY(hyperlink-scheme-allowlist): reject
+                            // javascript:/file:/data:/vbscript: before the
+                            // relationship is created. Internal targets
+                            // (Sheet!Cell, named ranges) already routed above
+                            // via TryParseInternalHyperlinkLocation.
+                            Core.HyperlinkUriValidator.RequireSafeScheme(value, "link");
                             var hlUri = new Uri(value, UriKind.RelativeOrAbsolute);
                             var hlRel = worksheet.AddHyperlinkRelationship(hlUri, isExternal: true);
                             var hl = new Hyperlink { Reference = cellRef.ToUpperInvariant(), Id = hlRel.Id };

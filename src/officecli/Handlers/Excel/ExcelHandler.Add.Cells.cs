@@ -581,6 +581,8 @@ public partial class ExcelHandler
             }
             else
             {
+                // CONSISTENCY(hyperlink-scheme-allowlist): see Set.cs cell link.
+                Core.HyperlinkUriValidator.RequireSafeScheme(linkUrl, "link");
                 var hlUri = new Uri(linkUrl, UriKind.RelativeOrAbsolute);
                 var hlRel = cellWorksheet.AddHyperlinkRelationship(hlUri, isExternal: true);
                 var hl = new Hyperlink { Reference = cellRef.ToUpperInvariant(), Id = hlRel.Id };
