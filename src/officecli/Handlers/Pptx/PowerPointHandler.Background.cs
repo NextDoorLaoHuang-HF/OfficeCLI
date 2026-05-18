@@ -104,6 +104,15 @@ public partial class PowerPointHandler
         else if (value.StartsWith("image:", StringComparison.OrdinalIgnoreCase))
         {
             var imagePath = value[6..].Trim();
+            // Reject HTTP(S) URLs upfront. ImageSource.Resolve would attempt a
+            // network fetch and surface raw HttpClient exceptions; that turns a
+            // foreseeable network dependency into a noisy stack trace. Require
+            // the caller to download the file first so failures are local-only.
+            if (imagePath.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                imagePath.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException(
+                    $"background=image:<URL> is not supported (got '{imagePath}'). " +
+                    "Download the file to a local path first, then pass background=image:/local/path.");
             prepared = PrepareBackgroundImage(imagePath, imgOpts);
         }
         else
