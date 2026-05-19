@@ -606,8 +606,10 @@ internal static partial class ChartHelper
             .FirstOrDefault(s => s.GetFirstChild<C.Trendline>() != null);
         if (firstTrendlineSer != null)
         {
-            var tlType = firstTrendlineSer.GetFirstChild<C.Trendline>()?.GetFirstChild<C.TrendlineType>()?.Val;
-            if (tlType?.HasValue == true) node.Format["trendline"] = tlType.InnerText;
+            var firstTl = firstTrendlineSer.GetFirstChild<C.Trendline>();
+            var tlType = firstTl?.GetFirstChild<C.TrendlineType>()?.Val;
+            if (tlType?.HasValue == true)
+                node.Format["trendline"] = FormatTrendlineSpec(firstTl!, tlType.InnerText);
         }
 
         if (depth > 0)
@@ -706,7 +708,8 @@ internal static partial class ChartHelper
                 if (trendline != null)
                 {
                     var tlType = trendline.GetFirstChild<C.TrendlineType>()?.Val;
-                    if (tlType?.HasValue == true) seriesNode.Format["trendline"] = tlType.InnerText;
+                    if (tlType?.HasValue == true)
+                        seriesNode.Format["trendline"] = FormatTrendlineSpec(trendline, tlType.InnerText);
                     var dispRSqr = trendline.GetFirstChild<C.DisplayRSquaredValue>()?.Val;
                     if (dispRSqr?.HasValue == true && dispRSqr.Value) seriesNode.Format["trendline.dispRSqr"] = "true";
                     var dispEq = trendline.GetFirstChild<C.DisplayEquation>()?.Val;
@@ -1111,6 +1114,27 @@ internal static partial class ChartHelper
         if (linear?.Angle?.HasValue == true && linear.Angle.Value != 0)
             spec += ":" + (linear.Angle.Value / 60000);
         return spec;
+    }
+
+    /// <summary>
+    /// Build the canonical trendline spec string from a <c:trendline> element.
+    /// Embeds order for poly (poly:N) and period for movingAvg (movingAvg:N) so
+    /// dump→batch replay round-trips the polynomial degree / window size that
+    /// were otherwise silently dropped (the bare type name lost the parameter).
+    /// </summary>
+    private static string FormatTrendlineSpec(C.Trendline trendline, string typeName)
+    {
+        if (string.Equals(typeName, "poly", StringComparison.OrdinalIgnoreCase))
+        {
+            var order = trendline.GetFirstChild<C.PolynomialOrder>()?.Val;
+            if (order?.HasValue == true) return $"poly:{order.Value}";
+        }
+        else if (string.Equals(typeName, "movingAvg", StringComparison.OrdinalIgnoreCase))
+        {
+            var period = trendline.GetFirstChild<C.Period>()?.Val;
+            if (period?.HasValue == true) return $"movingAvg:{period.Value}";
+        }
+        return typeName;
     }
 
     /// <summary>
