@@ -2392,6 +2392,38 @@ public partial class WordHandler
             }
         }
 
+        // v5.10: trackChange=format on table → <w:tblPrChange> inside <w:tblPr>.
+        // Records a format-change revision marker. When present, the current
+        // tblPr state is the NEW state; the inner PreviousTableProperties
+        // stores the OLD state. For idempotency, replace any existing tblPrChange.
+        if ((properties.TryGetValue("trackChange", out var tblTcKind)
+             || properties.TryGetValue("trackchange", out tblTcKind))
+            && tblTcKind?.Trim().ToLowerInvariant() == "format")
+        {
+            string? tblTcAuthor = null;
+            string? tblTcDate = null;
+            string? tblTcId = null;
+            properties.TryGetValue("trackChange.author", out tblTcAuthor);
+            if (tblTcAuthor == null) properties.TryGetValue("trackchange.author", out tblTcAuthor);
+            properties.TryGetValue("trackChange.date", out tblTcDate);
+            if (tblTcDate == null) properties.TryGetValue("trackchange.date", out tblTcDate);
+            properties.TryGetValue("trackChange.id", out tblTcId);
+            if (tblTcId == null) properties.TryGetValue("trackchange.id", out tblTcId);
+            // Remove existing tblPrChange for idempotency
+            tblPr.RemoveAllChildren<TablePropertiesChange>();
+            var tblPrChange = new TablePropertiesChange();
+            if (!string.IsNullOrEmpty(tblTcAuthor)) tblPrChange.Author = tblTcAuthor;
+            if (!string.IsNullOrEmpty(tblTcDate) && DateTime.TryParse(tblTcDate, out var tblTcDt))
+                tblPrChange.Date = tblTcDt;
+            tblPrChange.Id = !string.IsNullOrEmpty(tblTcId)
+                ? tblTcId : GetNextRevisionId().ToString();
+            tblPrChange.AppendChild(new PreviousTableProperties());
+            InsertTblPrChildInOrder(tblPr, tblPrChange);
+        }
+        // Remove trackChange dotted keys from unsupported list
+        unsupported.RemoveAll(k => k.StartsWith("trackChange", StringComparison.OrdinalIgnoreCase)
+                                 || k.StartsWith("trackchange", StringComparison.OrdinalIgnoreCase));
+
         var affectedPara = tbl.Ancestors<Paragraph>().FirstOrDefault();
         if (affectedPara != null)
             affectedPara.TextId = GenerateParaId();

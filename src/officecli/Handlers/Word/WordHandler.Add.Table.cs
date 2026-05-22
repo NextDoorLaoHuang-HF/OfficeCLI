@@ -654,6 +654,52 @@ public partial class WordHandler
             LastAddUnsupportedProps.Add(key);
         }
 
+        // v5.10: trackChange=ins/del on table row → <w:ins>/<w:del> inside <w:trPr>.
+        // Table-level revision markers are NOT wrappers (unlike InsertedRun/DeletedRun);
+        // they are markers inside trPr. Same pattern as MiniMax TrackChangesSamples.
+        if ((properties.TryGetValue("trackChange", out var trTcKind)
+             || properties.TryGetValue("trackchange", out trTcKind))
+            && (trTcKind?.Trim().ToLowerInvariant() == "ins"
+                || trTcKind?.Trim().ToLowerInvariant() == "del"))
+        {
+            var kind = trTcKind.Trim().ToLowerInvariant();
+            string? trTcAuthor = null;
+            string? trTcDate = null;
+            string? trTcId = null;
+            properties.TryGetValue("trackChange.author", out trTcAuthor);
+            if (trTcAuthor == null) properties.TryGetValue("trackchange.author", out trTcAuthor);
+            properties.TryGetValue("trackChange.date", out trTcDate);
+            if (trTcDate == null) properties.TryGetValue("trackchange.date", out trTcDate);
+            properties.TryGetValue("trackChange.id", out trTcId);
+            if (trTcId == null) properties.TryGetValue("trackchange.id", out trTcId);
+            newRowProps ??= newRow.PrependChild(new TableRowProperties());
+            if (kind == "ins")
+            {
+                var marker = new Inserted();
+                if (!string.IsNullOrEmpty(trTcAuthor)) marker.Author = trTcAuthor;
+                if (!string.IsNullOrEmpty(trTcDate) && DateTime.TryParse(trTcDate, out var trDate))
+                    marker.Date = trDate;
+                marker.Id = !string.IsNullOrEmpty(trTcId) ? trTcId : GetNextRevisionId().ToString();
+                newRowProps.AppendChild(marker);
+            }
+            else // del
+            {
+                var marker = new Deleted();
+                if (!string.IsNullOrEmpty(trTcAuthor)) marker.Author = trTcAuthor;
+                if (!string.IsNullOrEmpty(trTcDate) && DateTime.TryParse(trTcDate, out var trDate))
+                    marker.Date = trDate;
+                marker.Id = !string.IsNullOrEmpty(trTcId) ? trTcId : GetNextRevisionId().ToString();
+                newRowProps.AppendChild(marker);
+            }
+        }
+        // Skip trackChange dotted keys from falling into unsupported
+        foreach (var key in properties.Keys.ToList())
+        {
+            if (key.StartsWith("trackChange.", StringComparison.OrdinalIgnoreCase)
+                || key.StartsWith("trackchange.", StringComparison.OrdinalIgnoreCase))
+                LastAddUnsupportedProps.Remove(key); // consumed, not unsupported
+        }
+
         if (index.HasValue)
         {
             var existingRows = targetTable.Elements<TableRow>().ToList();
