@@ -640,6 +640,12 @@
       "get": true,
       "readback": "BCP-47 locale string",
       "enforcement": "report"
+    },
+    "trackRevisions": {
+      "type": "boolean",
+      "set": true,
+      "get": true,
+      "description": "Toggle track changes mode (w:trackChanges in settings)"
     }
   }
 }

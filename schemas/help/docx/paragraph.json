@@ -1174,6 +1174,27 @@
       "get": true,
       "readback": "font name",
       "enforcement": "report"
+    },
+    "trackChange": {
+      "type": "enum",
+      "values": ["ins", "del", "format", "moveFrom", "moveTo"],
+      "add": true,
+      "description": "Create revision mark wrapping this paragraph (format for pPrChange)"
+    },
+    "trackChange.author": {
+      "type": "string",
+      "add": true,
+      "description": "Author for the revision mark"
+    },
+    "trackChange.date": {
+      "type": "string",
+      "add": true,
+      "description": "Date/time for the revision mark (ISO 8601)"
+    },
+    "trackChange.id": {
+      "type": "string",
+      "add": true,
+      "description": "Unique revision ID (auto-assigned if omitted)"
     }
   }
 }

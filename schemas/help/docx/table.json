@@ -141,6 +141,27 @@
       ],
       "readback": "n/a",
       "enforcement": "report"
+    },
+    "trackChange": {
+      "type": "enum",
+      "values": ["format"],
+      "set": true,
+      "description": "Create format-change revision mark for table properties"
+    },
+    "trackChange.author": {
+      "type": "string",
+      "set": true,
+      "description": "Author for the revision mark"
+    },
+    "trackChange.date": {
+      "type": "string",
+      "set": true,
+      "description": "Date/time for the revision mark (ISO 8601)"
+    },
+    "trackChange.id": {
+      "type": "string",
+      "set": true,
+      "description": "Unique revision ID (auto-assigned if omitted)"
     }
   }
 }

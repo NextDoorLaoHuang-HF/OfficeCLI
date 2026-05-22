@@ -51,6 +51,27 @@
       "description": "row height rule readback — `exact` when the row enforces a fixed height, otherwise absent (auto/atLeast).",
       "readback": "`exact` when set",
       "enforcement": "report"
+    },
+    "trackChange": {
+      "type": "enum",
+      "values": ["ins", "del"],
+      "add": true,
+      "description": "Create revision mark for this table row"
+    },
+    "trackChange.author": {
+      "type": "string",
+      "add": true,
+      "description": "Author for the revision mark"
+    },
+    "trackChange.date": {
+      "type": "string",
+      "add": true,
+      "description": "Date/time for the revision mark (ISO 8601)"
+    },
+    "trackChange.id": {
+      "type": "string",
+      "add": true,
+      "description": "Unique revision ID (auto-assigned if omitted)"
     }
   }
 }
