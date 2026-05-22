@@ -3728,6 +3728,39 @@ public partial class WordHandler
         }
     }
 
+    // ==================== Revision IDs (track changes) ====================
+
+    /// <summary>
+    /// Get the next unique revision ID by scanning all existing revision elements
+    /// in the document body and returning max(id) + 1.
+    /// OOXML requires revision IDs to be unique non-negative integers across
+    /// all revision elements (w:ins, w:del, w:moveFrom, w:moveTo, rPrChange,
+    /// pPrChange, sectPrChange, tblPrChange, and table-row markers).
+    /// </summary>
+    private int GetNextRevisionId()
+    {
+        int maxId = 0;
+        var body = _doc.MainDocumentPart?.Document?.Body;
+        if (body != null)
+        {
+            foreach (var elem in body.Descendants())
+            {
+                if (elem is InsertedRun or DeletedRun or MoveFromRun or MoveToRun
+                    or RunPropertiesChange or ParagraphPropertiesChange
+                    or SectionPropertiesChange or TablePropertiesChange
+                    or Inserted or Deleted
+                    or MoveFrom or MoveTo)
+                {
+                    var idAttr = elem.GetAttributes()
+                        .FirstOrDefault(a => a.LocalName == "id");
+                    if (idAttr.Value != null && int.TryParse(idAttr.Value, out int id) && id > maxId)
+                        maxId = id;
+                }
+            }
+        }
+        return maxId + 1;
+    }
+
     // ==================== SDT IDs (content controls) ====================
 
     /// <summary>
