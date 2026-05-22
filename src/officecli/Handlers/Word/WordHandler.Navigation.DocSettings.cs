@@ -132,6 +132,10 @@ public partial class WordHandler
         if (defTabStop?.Val?.Value != null)
             node.Format["defaultTabStop"] = FormatTwipsToCm((uint)defTabStop.Val.Value);
 
+        // ==================== Track Changes ====================
+        if (settings.GetFirstChild<TrackRevisions>() != null)
+            node.Format["trackRevisions"] = true;
+
         // ==================== Theme Font Languages ====================
         // CONSISTENCY(locale-readback): `--locale ar-SA` writes
         // settings/themeFontLang on Set; `Get /` must surface the same
