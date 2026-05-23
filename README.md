@@ -8,6 +8,12 @@ Open-source. Single binary. No Office installation. No dependencies. Works every
 
 **Built-in agent-friendly rendering engine** — agents can *see* what they create, no Office required. Render `.docx` / `.xlsx` / `.pptx` to HTML or PNG, closing the *render → look → fix* loop anywhere the binary runs.
 
+> **🔔 AionUI 用户**：OfficeCLI v5.10+ 已支持 Track Changes 修订模式，但 AionUI 内置 skill 尚未包含。一行命令补齐：
+> ```bash
+> mkdir -p ~/.aionui-config/skills/officecli-track-changes && curl -fsSL https://raw.githubusercontent.com/NextDoorLaoHuang-HF/OfficeCLI/main/aionui-skill/SKILL.md -o ~/.aionui-config/skills/officecli-track-changes/SKILL.md
+> ```
+> 然后在 AionUI 设置 → Skills 中启用 `officecli-track-changes`。详见 [aionui-skill/README.md](aionui-skill/README.md)。
+
 [![GitHub Release](https://img.shields.io/github/v/release/iOfficeAI/OfficeCLI)](https://github.com/iOfficeAI/OfficeCLI/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
@@ -612,18 +618,6 @@ Bug reports and contributions are welcome on [GitHub Issues](https://github.com/
 If you find OfficeCLI useful, please [give it a star on GitHub](https://github.com/iOfficeAI/OfficeCLI) — it helps others discover the project.
 
 [OfficeCLI.AI](https://OfficeCLI.AI) | [GitHub](https://github.com/iOfficeAI/OfficeCLI)
-
-## AionUI Track Changes Skill
-
-OfficeCLI v5.10+ supports Track Changes / 修订模式 (`--prop trackChange=ins/del/format`), but the AionUI builtin skill does not include this section yet. A user skill is available as a temporary fix:
-
-```bash
-mkdir -p ~/.aionui-config/skills/officecli-track-changes
-curl -fsSL https://raw.githubusercontent.com/NextDoorLaoHuang-HF/OfficeCLI/main/aionui-skill/SKILL.md \
-  -o ~/.aionui-config/skills/officecli-track-changes/SKILL.md
-```
-
-Then enable `officecli-track-changes` in AionUI Settings → Skills. See [aionui-skill/README.md](aionui-skill/README.md) for details.
 
 <!--
 yaml-frontmatter:
