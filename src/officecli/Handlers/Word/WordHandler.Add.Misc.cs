@@ -1,0 +1,1823 @@
+// Copyright 2025 OfficeCLI (officecli.ai)
+// SPDX-License-Identifier: Apache-2.0
+
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Wordprocessing;
+using OfficeCli.Core;
+
+namespace OfficeCli.Handlers;
+
+public partial class WordHandler
+{
+    private string AddComment(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
+    {
+        var body = _doc.MainDocumentPart?.Document?.Body
+            ?? throw new InvalidOperationException("Document body not found");
+
+        if (!properties.TryGetValue("text", out var commentText))
+            throw new ArgumentException("'text' property is required for comment type");
+
+        var commentRun = parent as Run;
+        var commentPara = commentRun?.Parent as Paragraph ?? parent as Paragraph
+            ?? throw new ArgumentException("Comments must be added to a paragraph or run: /body/p[N] or /body/p[N]/r[M]");
+
+        var author = properties.GetValueOrDefault("author", "officecli");
+        var initials = properties.GetValueOrDefault("initials", author[..1]);
+
+        // Pre-validate user-supplied strings for invalid XML 1.0 chars
+        // (U+0001..U+001F minus tab/LF/CR). Without this, a C0 control char
+        // in author/initials/text would let us append the comment to the
+        // comments part, then explode at Save() — producing an orphaned
+        // comment with no anchor in the body (torn write).
+        static void RejectIllegalXmlChars(string field, string value)
+        {
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if (c == '\t' || c == '\n' || c == '\r') continue;
+                if (c < 0x20)
+                    throw new ArgumentException(
+                        $"'{field}' contains an illegal XML 1.0 control character (U+{(int)c:X04}); allowed C0 chars are tab/LF/CR only.");
+            }
+        }
+        RejectIllegalXmlChars("text", commentText);
+        RejectIllegalXmlChars("author", author);
+        RejectIllegalXmlChars("initials", initials);
+        var commentsPart = _doc.MainDocumentPart!.WordprocessingCommentsPart
+            ?? _doc.MainDocumentPart.AddNewPart<WordprocessingCommentsPart>();
+        commentsPart.Comments ??= new Comments();
+
+        var commentId = (commentsPart.Comments.Elements<Comment>()
+            .Select(c => int.TryParse(c.Id?.Value, out var id) ? id : 0)
+            .DefaultIfEmpty(0).Max() + 1).ToString();
+
+        var commentEl = new Comment(
+            new Paragraph(new Run(new Text(commentText) { Space = SpaceProcessingModeValues.Preserve })))
+        {
+            Id = commentId, Author = author, Initials = initials,
+            // CONSISTENCY(date-roundtrip): RoundtripKind keeps DateTimeKind.Utc
+            // (input ending in Z stays UTC and serializes back with Z) and
+            // DateTimeKind.Local with explicit offset (input "...+08:00" keeps
+            // the +08:00 form). Default Parse converts everything to Local,
+            // poisoning round-trip on docs whose comment dates are UTC.
+            Date = properties.TryGetValue("date", out var ds) ? DateTime.Parse(ds, null, System.Globalization.DateTimeStyles.RoundtripKind) : DateTime.UtcNow
+        };
+        commentsPart.Comments.AppendChild(commentEl);
+        // Apply paragraph-level / run-level format keys (direction, font, size, etc.)
+        // Mirrors R2-2 footnote/header fix — the same vocabulary should work
+        // on comment bodies as on footnote/endnote bodies.
+        var _commentUnsupported = new List<string>();
+        ApplyCommentFormatKeys(commentEl, properties, _commentUnsupported);
+        commentsPart.Comments.Save();
+
+        var rangeStart = new CommentRangeStart { Id = commentId };
+        var rangeEnd = new CommentRangeEnd { Id = commentId };
+        var refRun = new Run(new CommentReference { Id = commentId });
+
+        if (commentRun != null)
+        {
+            commentRun.InsertBeforeSelf(rangeStart);
+            commentRun.InsertAfterSelf(rangeEnd);
+            rangeEnd.InsertAfterSelf(refRun);
+        }
+        else
+        {
+            // index is a childElement-index (ResolveAnchorPosition counts pPr).
+            // Use pPr-aware insert so an index pointing at ParagraphProperties
+            // clamps forward (pPr must stay first child).
+            if (index.HasValue)
+            {
+                InsertIntoParagraph(commentPara, new OpenXmlElement[] { rangeStart, rangeEnd, refRun }, index);
+            }
+            else
+            {
+                // CONSISTENCY(comment-runStart): when caller passes runStart=N (N>=1),
+                // place rangeStart immediately AFTER the Nth run in the paragraph
+                // so dump round-trip restores the anchor position. N=0 keeps the
+                // legacy paragraph-start placement.
+                int runStartIdx = 0;
+                if ((properties.TryGetValue("runstart", out var rsRaw)
+                     || properties.TryGetValue("runStart", out rsRaw))
+                    && int.TryParse(rsRaw, out var rsN))
+                    runStartIdx = rsN;
+                OpenXmlElement? anchorRun = null;
+                if (runStartIdx >= 1)
+                {
+                    var runs = commentPara.Elements<Run>().ToList();
+                    if (runStartIdx <= runs.Count)
+                        anchorRun = runs[runStartIdx - 1];
+                }
+                if (anchorRun != null)
+                {
+                    anchorRun.InsertAfterSelf(rangeStart);
+                }
+                else
+                {
+                    var after = commentPara.ParagraphProperties as OpenXmlElement;
+                    if (after != null) after.InsertAfterSelf(rangeStart);
+                    else commentPara.InsertAt(rangeStart, 0);
+                }
+                commentPara.AppendChild(rangeEnd);
+                commentPara.AppendChild(refRun);
+            }
+        }
+
+        // Return navigable path using /comments/comment[N] (sequential index)
+        var commentIndex = commentsPart.Comments.Elements<Comment>().ToList()
+            .FindIndex(c => c.Id?.Value == commentId) + 1;
+        var resultPath = $"/comments/comment[{commentIndex}]";
+        return resultPath;
+    }
+
+    private string AddBookmark(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
+    {
+        var body = _doc.MainDocumentPart?.Document?.Body
+            ?? throw new InvalidOperationException("Document body not found");
+
+        // BUG-FIX(B2): bookmarks under a table cell are inline content. The cell
+        // schema only accepts block-level children (p/tbl/sdt), so redirect to
+        // the cell's first paragraph (creating one if the cell is empty) and
+        // append the bookmark path segment to the parent path so the returned
+        // path is round-trippable via Get.
+        if (parent is TableCell tc)
+        {
+            var firstPara = tc.Elements<Paragraph>().FirstOrDefault();
+            if (firstPara == null)
+            {
+                firstPara = new Paragraph();
+                AssignParaId(firstPara);
+                tc.AppendChild(firstPara);
+            }
+            var paraIdx = tc.Elements<Paragraph>().ToList().IndexOf(firstPara) + 1;
+            parent = firstPara;
+            parentPath = $"{parentPath}/{BuildParaPathSegment(firstPara, paraIdx)}";
+            // Drop --index — it referred to a position inside the cell, not
+            // inside the paragraph; preserving it would silently mis-anchor.
+            index = null;
+        }
+
+        var bkName = properties.GetValueOrDefault("name", "");
+        if (string.IsNullOrEmpty(bkName))
+            throw new ArgumentException("'name' property is required for bookmark");
+
+        if (bkName.Any(c => c == '/' || c == '[' || c == ']'))
+            throw new ArgumentException(
+                $"Bookmark name '{bkName}' contains path-special characters " +
+                "('/', '[', ']'). These characters prevent later addressing via " +
+                "selectors. Use only letters, digits, '.', '_', '-' in bookmark names.");
+        if (bkName.Any(char.IsWhiteSpace) || bkName[0] == '@' || bkName[0] == '\'' || bkName.Contains('"'))
+            throw new ArgumentException(
+                $"Bookmark name '{bkName}' contains whitespace or quote/@ chars " +
+                "that prevent later addressing via bare attribute selectors. " +
+                "Use only letters, digits, '.', '_', '-' in bookmark names.");
+
+        // Reject duplicate bookmark names. OOXML bookmark names are expected
+        // to be unique per document; tolerating duplicates makes
+        // /bookmark[@name=X] ambiguous (it picks the first), so the path
+        // returned by `add` may not identify the bookmark just inserted.
+        var existingStarts = body.Descendants<BookmarkStart>().ToList();
+        if (existingStarts.Any(b => string.Equals(b.Name?.Value, bkName, StringComparison.Ordinal)))
+        {
+            throw new ArgumentException(
+                $"bookmark name '{bkName}' already exists; pick a unique name.");
+        }
+
+        var existingIds = existingStarts
+            .Select(b => int.TryParse(b.Id?.Value, out var id) ? id : 0);
+        var bkId = (existingIds.Any() ? existingIds.Max() + 1 : 1).ToString();
+
+        var bookmarkStart = new BookmarkStart { Id = bkId, Name = bkName };
+        var bookmarkEnd = new BookmarkEnd { Id = bkId };
+
+        // BUG-DUMP10-04: optional endPara offset (>0) defers BookmarkEnd
+        // placement to a later paragraph in the same body so multi-
+        // paragraph bookmark spans round-trip through dump→batch. Default
+        // (0 / unset) keeps the End next to the Start as before.
+        int crossParaEndOffset = 0;
+        if ((properties.TryGetValue("endPara", out var bkEndStr)
+                || properties.TryGetValue("endpara", out bkEndStr))
+            && int.TryParse(bkEndStr, out var bkEndN) && bkEndN > 0)
+        {
+            crossParaEndOffset = bkEndN;
+        }
+
+        // index is a childElement-index (ResolveAnchorPosition counts pPr).
+        // When anchor-based insert is requested, bypass the text-wrapping path
+        // (which finds its own position inside existing runs) and do a positional
+        // insert — the anchor wins. Route through the pPr-aware helper so an
+        // index pointing at ParagraphProperties clamps forward.
+        var bkPara = parent as Paragraph;
+        var hasAnchor = index.HasValue && bkPara != null
+            && index.Value >= 0 && index.Value < bkPara.ChildElements.Count;
+
+        // When the body-wrap branch runs, the bookmark lives inside a newly
+        // created <w:p>, not directly under Body. Track that so we can
+        // return a path that descends into the wrapping paragraph — otherwise
+        // `{parentPath}/bookmarkStart[...]` fails Get (CONSISTENCY(add-get-symmetry)).
+        Paragraph? wrappingPara = null;
+
+        if (properties.TryGetValue("text", out var bkText))
+        {
+            if (hasAnchor && bkPara != null)
+            {
+                var bkRun = new Run(new Text(bkText) { Space = SpaceProcessingModeValues.Preserve });
+                InsertIntoParagraph(bkPara, new OpenXmlElement[] { bookmarkStart, bkRun, bookmarkEnd }, index);
+            }
+            else if (parent is Body)
+            {
+                // Runs must live inside a paragraph; wrap Start+Run+End in a new
+                // <w:p> before inserting so we don't produce bare <w:r> as a
+                // direct body child (schema-invalid).
+                var bkRun = new Run(new Text(bkText) { Space = SpaceProcessingModeValues.Preserve });
+                var wrapPara = new Paragraph(bookmarkStart, bkRun, bookmarkEnd);
+                InsertAtIndexOrAppend(parent, wrapPara, index);
+                wrappingPara = wrapPara;
+            }
+            else
+            {
+                // Try to find existing runs whose concatenated text contains the bookmark text
+                var runs = parent.Elements<Run>().ToList();
+                var wrapped = TryWrapExistingRunsWithBookmark(parent, runs, bkText, bookmarkStart, bookmarkEnd);
+                if (!wrapped)
+                {
+                    // No matching text found — create a new run as fallback.
+                    // Route through InsertAtIndexOrAppend so body-level inserts
+                    // respect the trailing <w:sectPr> invariant (bookmarks
+                    // landing after sectPr would be schema-invalid).
+                    InsertAtIndexOrAppend(parent, bookmarkStart, index);
+                    InsertAtIndexOrAppend(parent, new Run(new Text(bkText) { Space = SpaceProcessingModeValues.Preserve }),
+                        index.HasValue ? index + 1 : null);
+                    InsertAtIndexOrAppend(parent, bookmarkEnd,
+                        index.HasValue ? index + 2 : null);
+                }
+            }
+        }
+        else if (hasAnchor && bkPara != null)
+        {
+            InsertIntoParagraph(bkPara, new OpenXmlElement[] { bookmarkStart, bookmarkEnd }, index);
+        }
+        else
+        {
+            // Body/other parents: honor --index/--after/--before and respect
+            // Body's trailing <w:sectPr> invariant by routing through
+            // InsertAtIndexOrAppend (which falls back to AppendToParent).
+            InsertAtIndexOrAppend(parent, bookmarkStart, index);
+            InsertAtIndexOrAppend(parent, bookmarkEnd, index.HasValue ? index + 1 : null);
+        }
+
+        // BUG-DUMP10-04: relocate the BookmarkEnd to a downstream sibling
+        // paragraph when endPara was specified. Done after the initial
+        // placement so all the existing schema-aware insertion paths
+        // (text wrap, anchor index, body fallback) still run unmodified.
+        if (crossParaEndOffset > 0 && bookmarkEnd.Parent != null)
+        {
+            // Walk up to the start's enclosing paragraph (it may be inside
+            // a run if TryWrapExistingRunsWithBookmark wrapped runs).
+            var startEnclosingPara = bookmarkStart.Ancestors<Paragraph>().FirstOrDefault()
+                ?? bookmarkStart.Parent as Paragraph;
+            // Sibling list lives on the paragraph's parent (Body, TableCell, …).
+            var siblingHost = startEnclosingPara?.Parent;
+            if (startEnclosingPara != null && siblingHost != null)
+            {
+                var siblings = siblingHost.Elements<Paragraph>().ToList();
+                int startIdx = siblings.IndexOf(startEnclosingPara);
+                int targetIdx = startIdx + crossParaEndOffset;
+                if (startIdx >= 0 && targetIdx < siblings.Count)
+                {
+                    bookmarkEnd.Remove();
+                    siblings[targetIdx].AppendChild(bookmarkEnd);
+                }
+            }
+        }
+
+        // Return a navigable path: /...parent/bookmarkStart[@name=<name>] is
+        // a real DOM element Navigation understands (the legacy
+        // `/bookmark[<name>]` form addressed a synthetic type that Get/Add
+        // could not resolve, breaking --after/--before reuse).
+        // ValidateAndNormalizePredicate rejects bare attribute values that
+        // contain whitespace, leading '@', or quote chars; double-quote the
+        // value when the raw name would otherwise be rejected so the returned
+        // path is round-trippable via `get`/`add --after`.
+        string resultPath;
+        if (wrappingPara != null)
+        {
+            var wrapIdx = parent.Elements<Paragraph>().ToList().IndexOf(wrappingPara) + 1;
+            resultPath = $"{parentPath}/{BuildParaPathSegment(wrappingPara, wrapIdx)}/bookmarkStart[@name={QuoteAttrValueIfNeeded(bkName)}]";
+        }
+        else
+        {
+            resultPath = $"{parentPath}/bookmarkStart[@name={QuoteAttrValueIfNeeded(bkName)}]";
+        }
+        return resultPath;
+    }
+
+    /// <summary>
+    /// Quote an attribute predicate value when the bare form would be rejected
+    /// by ValidateAndNormalizePredicate. Bare values must have no whitespace,
+    /// no leading '@' or quote. Embedded double quotes cannot be represented
+    /// by either form — error up front.
+    /// </summary>
+    private static string QuoteAttrValueIfNeeded(string value)
+    {
+        if (value.Contains('"'))
+            throw new ArgumentException(
+                $"Name '{value}' contains embedded double-quote, which cannot be represented in an attribute selector.");
+        bool needsQuote = value.Length == 0
+            || value[0] == '@' || value[0] == '\''
+            || value.Any(char.IsWhiteSpace);
+        return needsQuote ? $"\"{value}\"" : value;
+    }
+
+    /// <summary>
+    /// Tries to wrap existing runs whose concatenated text contains <paramref name="targetText"/>
+    /// with bookmarkStart/bookmarkEnd tags. Returns true if wrapping succeeded.
+    /// </summary>
+    private static bool TryWrapExistingRunsWithBookmark(
+        OpenXmlElement parent, List<Run> runs, string targetText,
+        BookmarkStart bookmarkStart, BookmarkEnd bookmarkEnd)
+    {
+        if (runs.Count == 0 || string.IsNullOrEmpty(targetText))
+            return false;
+
+        // Build a map: for each run, track the cumulative start offset and its text
+        var runTexts = new List<(Run Run, int Start, string Text)>();
+        var offset = 0;
+        foreach (var run in runs)
+        {
+            var t = string.Concat(run.Elements<Text>().Select(x => x.Text));
+            runTexts.Add((run, offset, t));
+            offset += t.Length;
+        }
+        var fullText = string.Concat(runTexts.Select(r => r.Text));
+
+        var matchIndex = fullText.IndexOf(targetText, StringComparison.Ordinal);
+        if (matchIndex < 0)
+            return false;
+
+        var matchEnd = matchIndex + targetText.Length;
+
+        // Find runs that overlap with [matchIndex, matchEnd)
+        var firstRunIdx = -1;
+        var lastRunIdx = -1;
+        for (var i = 0; i < runTexts.Count; i++)
+        {
+            var runStart = runTexts[i].Start;
+            var runEnd = runStart + runTexts[i].Text.Length;
+            if (runEnd <= matchIndex) continue;
+            if (runStart >= matchEnd) break;
+            if (firstRunIdx < 0) firstRunIdx = i;
+            lastRunIdx = i;
+        }
+
+        if (firstRunIdx < 0) return false;
+
+        // Handle partial overlap at the start: split the first run if needed
+        var firstRunInfo = runTexts[firstRunIdx];
+        if (matchIndex > firstRunInfo.Start)
+        {
+            var splitPos = matchIndex - firstRunInfo.Start;
+            var beforeText = firstRunInfo.Text[..splitPos];
+            var afterText = firstRunInfo.Text[splitPos..];
+
+            var beforeRun = (Run)firstRunInfo.Run.CloneNode(true);
+            SetRunText(beforeRun, beforeText);
+            parent.InsertBefore(beforeRun, firstRunInfo.Run);
+
+            SetRunText(firstRunInfo.Run, afterText);
+            // Update info
+            runTexts[firstRunIdx] = (firstRunInfo.Run, matchIndex, afterText);
+        }
+
+        // Handle partial overlap at the end: split the last run if needed
+        var lastRunInfo = runTexts[lastRunIdx];
+        var lastRunEnd = lastRunInfo.Start + lastRunInfo.Text.Length;
+        if (matchEnd < lastRunEnd)
+        {
+            var splitPos = matchEnd - lastRunInfo.Start;
+            var keepText = lastRunInfo.Text[..splitPos];
+            var tailText = lastRunInfo.Text[splitPos..];
+
+            var tailRun = (Run)lastRunInfo.Run.CloneNode(true);
+            SetRunText(tailRun, tailText);
+            parent.InsertAfter(tailRun, lastRunInfo.Run);
+
+            SetRunText(lastRunInfo.Run, keepText);
+            runTexts[lastRunIdx] = (lastRunInfo.Run, lastRunInfo.Start, keepText);
+        }
+
+        // Insert bookmarkStart before the first matched run
+        parent.InsertBefore(bookmarkStart, runTexts[firstRunIdx].Run);
+
+        // Insert bookmarkEnd after the last matched run
+        parent.InsertAfter(bookmarkEnd, runTexts[lastRunIdx].Run);
+
+        return true;
+    }
+
+    private static void SetRunText(Run run, string text)
+    {
+        var existing = run.Elements<Text>().ToList();
+        foreach (var t in existing) t.Remove();
+        run.AppendChild(new Text(text) { Space = SpaceProcessingModeValues.Preserve });
+    }
+
+    private string AddHyperlink(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
+    {
+        // CONSISTENCY(docx-hyperlink-canonical-url): canonical key is `url`
+        // (per schemas/help/docx/hyperlink.json). `href` and `link` are legacy
+        // input aliases; Get normalizes readback to `url`.
+        var hasUrl = properties.TryGetValue("url", out var hlUrl)
+            || properties.TryGetValue("href", out hlUrl)
+            || properties.TryGetValue("link", out hlUrl);
+        var hasAnchor = properties.TryGetValue("anchor", out var hlAnchor) || properties.TryGetValue("bookmark", out hlAnchor);
+        // BUG-DUMP10-05: a w:hyperlink element with neither r:id nor anchor
+        // is still a valid Word construct (tooltip-only / target-frame-only
+        // hover popups). Only reject when none of the four destination /
+        // metadata attributes are present so the wrapper can survive
+        // dump→batch round-trip.
+        var hasTooltip = properties.ContainsKey("tooltip");
+        var hasTgtFrame = properties.ContainsKey("tgtFrame") || properties.ContainsKey("tgtframe");
+        var hasHistory = properties.ContainsKey("history");
+        if (!hasUrl && !hasAnchor && !hasTooltip && !hasTgtFrame && !hasHistory)
+            throw new ArgumentException("'url' or 'anchor' property is required for hyperlink type");
+
+        if (parent is not Paragraph hlPara)
+            throw new ArgumentException("Hyperlinks can only be added to paragraphs: /body/p[N]");
+
+        string? hlRelId = null;
+        if (hasUrl)
+        {
+            // BUG-FIX(B1): hyperlinks inside header/footer/footnote/endnote
+            // must add the rel to the enclosing host part (e.g. header1.xml.rels),
+            // not document.xml.rels. Otherwise Word can't resolve the rId.
+            var hostPart = ResolveHostPart(hlPara);
+            // BUG-DUMP27: accept fragment-only URIs (e.g. "#_ftn1") in addition
+            // to absolute URIs, to support dump→batch round-trip of internal-anchor
+            // hyperlinks stored as r:id relationships with Target="#anchor".
+            // Word's .rels accepts these per RFC 3986; mark them isExternal=false
+            // so the .rels TargetMode is omitted (consistent with native Word output).
+            var hlIsFragment = !string.IsNullOrEmpty(hlUrl) && hlUrl.StartsWith('#');
+            Uri? hlUri;
+            if (hlIsFragment)
+                hlUri = new Uri(hlUrl!, UriKind.Relative);
+            else if (!Uri.TryCreate(hlUrl, UriKind.Absolute, out hlUri))
+                throw new ArgumentException($"Invalid hyperlink URL '{hlUrl}'. Expected a valid absolute URI (e.g. 'https://example.com') or a fragment-only anchor (e.g. '#bookmark').");
+            // CONSISTENCY(hyperlink-scheme-allowlist): gate absolute URIs only.
+            if (!hlIsFragment)
+                Core.HyperlinkUriValidator.RequireSafeScheme(hlUrl!, "url");
+            hlRelId = hostPart.AddHyperlinkRelationship(hlUri!, isExternal: !hlIsFragment).Id;
+        }
+
+        var hlRProps = new RunProperties();
+        if (properties.TryGetValue("color", out var hlColor))
+            hlRProps.Color = new Color { Val = SanitizeHex(hlColor) };
+        else
+        {
+            // Read hyperlink color from document theme, fallback to Word default
+            var themeHlink = _doc.MainDocumentPart?.ThemePart?.Theme?.ThemeElements
+                ?.ColorScheme?.Hyperlink?.RgbColorModelHex?.Val?.Value;
+            hlRProps.Color = new Color { Val = themeHlink ?? "0563C1", ThemeColor = ThemeColorValues.Hyperlink };
+        }
+        hlRProps.Underline = new Underline { Val = UnderlineValues.Single };
+        if (properties.TryGetValue("font", out var hlFont))
+            hlRProps.RunFonts = new RunFonts { Ascii = hlFont, HighAnsi = hlFont };
+        // Dump emits font.latin alongside bare font for hyperlink runs; mirror
+        // the bare-font behavior so batch replay doesn't silently drop it.
+        if (properties.TryGetValue("font.latin", out var hlFontLatin))
+        {
+            hlRProps.RunFonts ??= new RunFonts();
+            hlRProps.RunFonts.Ascii = hlFontLatin;
+            hlRProps.RunFonts.HighAnsi = hlFontLatin;
+        }
+        // BUG-DUMP17-07: mirror per-script font slot from Add.Text. Without this
+        // branch, dump emits font.cs on hyperlink runs but batch replay silently
+        // drops it.
+        if (properties.TryGetValue("font.cs", out var hlFontCs)
+            || properties.TryGetValue("font.complexscript", out hlFontCs)
+            || properties.TryGetValue("font.complex", out hlFontCs))
+        {
+            hlRProps.RunFonts ??= new RunFonts();
+            hlRProps.RunFonts.ComplexScript = hlFontCs;
+        }
+        if (properties.TryGetValue("size", out var hlSize))
+            hlRProps.FontSize = new FontSize { Val = ((int)Math.Round(ParseFontSize(hlSize) * 2, MidpointRounding.AwayFromZero)).ToString() };
+        if (properties.TryGetValue("bold", out var hlBold) && IsTruthy(hlBold))
+            hlRProps.Bold = new Bold();
+        if (properties.TryGetValue("italic", out var hlItalic) && IsTruthy(hlItalic))
+            hlRProps.Italic = new Italic();
+        // CONSISTENCY(add-set-symmetry): hyperlink runs commonly bind to the
+        // built-in `Hyperlink` character style (rStyle=Hyperlink) so they
+        // pick up the document's hyperlink theme color/underline. Run Add
+        // and paragraph dump emit echo rStyle back; AddHyperlink must
+        // accept it on the wrapped run or batch replay strips it with an
+        // UNSUPPORTED warning. BUG-R4-BT5.
+        if (properties.TryGetValue("rStyle", out var hlRStyle) || properties.TryGetValue("rstyle", out hlRStyle))
+        {
+            if (!string.IsNullOrEmpty(hlRStyle))
+                hlRProps.RunStyle = new RunStyle { Val = hlRStyle };
+        }
+        // CONSISTENCY(rtl-cascade): inherit pPr/bidi from the enclosing
+        // paragraph onto the hyperlink's run rPr. Mirrors the cascade in
+        // SetElementParagraph / Add.Text run insertion (R16-bt-3). Without
+        // this, a hyperlink inserted into an RTL paragraph renders LTR
+        // because the run's RightToLeftText is missing — and effective.rtl
+        // never resolves on the run NodeBuilder side either.
+        if (hlPara.ParagraphProperties?.BiDi != null)
+            ApplyRunFormatting(hlRProps, "rtl", "true");
+
+        var hlRun = new Run(hlRProps);
+        var hlText = properties.GetValueOrDefault("text", hlUrl ?? hlAnchor ?? "link");
+        hlRun.AppendChild(new Text(hlText) { Space = SpaceProcessingModeValues.Preserve });
+
+        var hyperlink = new Hyperlink(hlRun);
+        if (hlRelId != null)
+            hyperlink.Id = hlRelId;
+        if (hasAnchor)
+            hyperlink.Anchor = hlAnchor;
+        // BUG-DUMP24-02: w:docLocation is a separate "location in target
+        // document" attribute, distinct from w:anchor. Round-trip it so
+        // dump→batch preserves the wrapping hyperlink fully.
+        if (properties.TryGetValue("docLocation", out var hlDocLoc)
+            || properties.TryGetValue("doclocation", out hlDocLoc))
+            hyperlink.DocLocation = hlDocLoc;
+        // BUG-DUMP10-02: round-trip the optional metadata attrs.
+        if (hasTooltip && properties.TryGetValue("tooltip", out var hlTooltip))
+            hyperlink.Tooltip = hlTooltip;
+        if (hasTgtFrame &&
+            (properties.TryGetValue("tgtFrame", out var hlTgt)
+             || properties.TryGetValue("tgtframe", out hlTgt)))
+            hyperlink.TargetFrame = hlTgt;
+        if (hasHistory && properties.TryGetValue("history", out var hlHist) && IsTruthy(hlHist))
+            hyperlink.History = OnOffValue.FromBoolean(true);
+
+        // index is a childElement-index (ResolveAnchorPosition counts pPr).
+        // Route through pPr-aware helper so index 0 clamps forward past
+        // ParagraphProperties (pPr must stay first child of <w:p>).
+        InsertIntoParagraph(hlPara, hyperlink, index);
+
+        var hls = hlPara.Elements<Hyperlink>().ToList();
+        var idx = hls.FindIndex(h => ReferenceEquals(h, hyperlink));
+        var resultPath = $"{parentPath}/hyperlink[{(idx >= 0 ? idx + 1 : hls.Count)}]";
+        return resultPath;
+    }
+
+    private string AddField(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string>? properties, string type)
+    {
+        properties ??= new Dictionary<string, string>();
+        var body = _doc.MainDocumentPart?.Document?.Body
+            ?? throw new InvalidOperationException("Document body not found");
+
+        // Insert a field code (PAGE, NUMPAGES, DATE, etc.) as a run
+        // Determines field instruction from type or "field" property
+        // When type is "field", check fieldType/type property for dispatch
+        var effectiveType = type.ToLowerInvariant();
+        if (effectiveType == "field")
+        {
+            var ft = properties.GetValueOrDefault("fieldType")
+                  ?? properties.GetValueOrDefault("fieldtype")
+                  ?? properties.GetValueOrDefault("type");
+            if (ft != null) effectiveType = ft.ToLowerInvariant();
+        }
+        // Extract named parameters for field types that require them
+        string? mergeFieldName = null;
+        string? refBookmarkName = null;
+        string? seqIdentifier = null;
+
+        if (effectiveType == "mergefield")
+        {
+            mergeFieldName = properties.GetValueOrDefault("fieldName")
+                          ?? properties.GetValueOrDefault("fieldname")
+                          ?? properties.GetValueOrDefault("name");
+            if (string.IsNullOrWhiteSpace(mergeFieldName))
+                throw new ArgumentException("MERGEFIELD requires a 'fieldName' property (e.g. --prop fieldName=CustomerName).");
+        }
+        else if (effectiveType is "ref" or "pageref" or "noteref")
+        {
+            refBookmarkName = properties.GetValueOrDefault("bookmarkName")
+                           ?? properties.GetValueOrDefault("bookmarkname")
+                           ?? properties.GetValueOrDefault("bookmark")
+                           ?? properties.GetValueOrDefault("name");
+            if (string.IsNullOrWhiteSpace(refBookmarkName))
+                throw new ArgumentException($"{effectiveType.ToUpperInvariant()} requires a 'bookmarkName' property (e.g. --prop bookmarkName=MyBookmark).");
+        }
+        else if (effectiveType == "seq")
+        {
+            seqIdentifier = properties.GetValueOrDefault("identifier")
+                         ?? properties.GetValueOrDefault("name")
+                         ?? properties.GetValueOrDefault("id");
+            if (string.IsNullOrWhiteSpace(seqIdentifier))
+                throw new ArgumentException("SEQ requires an 'identifier' property (e.g. --prop identifier=Figure).");
+        }
+
+        // For STYLEREF and DOCPROPERTY, extract the required name parameter
+        string? styleRefName = null;
+        if (effectiveType == "styleref")
+        {
+            styleRefName = properties.GetValueOrDefault("styleName")
+                        ?? properties.GetValueOrDefault("stylename")
+                        ?? properties.GetValueOrDefault("name");
+            if (string.IsNullOrWhiteSpace(styleRefName))
+                throw new ArgumentException("STYLEREF requires a 'styleName' property (e.g. --prop styleName=\"Heading 1\").");
+        }
+        string? docPropertyName = null;
+        if (effectiveType == "docproperty")
+        {
+            docPropertyName = properties.GetValueOrDefault("propertyName")
+                           ?? properties.GetValueOrDefault("propertyname")
+                           ?? properties.GetValueOrDefault("name");
+            if (string.IsNullOrWhiteSpace(docPropertyName))
+                throw new ArgumentException("DOCPROPERTY requires a 'propertyName' property (e.g. --prop propertyName=Department).");
+        }
+
+        // DATE/TIME `\@` format switch is opt-in: only emit when the user
+        // supplied --prop format=… so a vanilla `add field --prop fieldType=date`
+        // produces a bare `DATE` field that Word renders with the user's
+        // locale default rather than a hardcoded ISO format.
+        var dateFmtSwitch = properties.TryGetValue("format", out var dateFmtVal)
+            && !string.IsNullOrWhiteSpace(dateFmtVal)
+            ? $"\\@ \"{dateFmtVal}\" " : "";
+        var fieldInstr = effectiveType switch
+        {
+            "pagenum" or "pagenumber" or "page" => " PAGE ",
+            "numpages" => " NUMPAGES ",
+            "sectionpages" => " SECTIONPAGES ",
+            "section" => " SECTION ",
+            "date" => $" DATE {dateFmtSwitch}".TrimEnd() + " ",
+            "createdate" => $" CREATEDATE {dateFmtSwitch}".TrimEnd() + " ",
+            "savedate" => $" SAVEDATE {dateFmtSwitch}".TrimEnd() + " ",
+            "printdate" => $" PRINTDATE {dateFmtSwitch}".TrimEnd() + " ",
+            "edittime" => " EDITTIME ",
+            "author" => " AUTHOR ",
+            "lastsavedby" => " LASTSAVEDBY ",
+            "title" => " TITLE ",
+            "subject" => " SUBJECT ",
+            "filename" => " FILENAME ",
+            "time" => $" TIME {dateFmtSwitch}".TrimEnd() + " ",
+            "numwords" => " NUMWORDS ",
+            "numchars" => " NUMCHARS ",
+            "revnum" => " REVNUM ",
+            "template" => " TEMPLATE ",
+            "comments" or "doccomments" => " COMMENTS ",
+            "keywords" => " KEYWORDS ",
+            // BUG-DUMP9-09: quote MERGEFIELD names containing whitespace so
+            // Word parses the full name as one token. " MERGEFIELD First Name "
+            // would otherwise be parsed as field "First" with arg "Name".
+            "mergefield" => $" MERGEFIELD {QuoteFieldNameIfNeeded(mergeFieldName!)}{AppendFieldSwitches(properties)} ",
+            "ref" => $" REF {refBookmarkName}{(IsTruthy(properties.GetValueOrDefault("hyperlink")) ? " \\h" : "")} ",
+            "pageref" => $" PAGEREF {refBookmarkName}{(IsTruthy(properties.GetValueOrDefault("hyperlink")) ? " \\h" : "")} ",
+            "noteref" => $" NOTEREF {refBookmarkName}{(IsTruthy(properties.GetValueOrDefault("hyperlink")) ? " \\h" : "")} ",
+            "seq" => $" SEQ {seqIdentifier}{AppendFieldSwitches(properties)} ",
+            "styleref" => $" STYLEREF \"{styleRefName}\" ",
+            "docproperty" => $" DOCPROPERTY \"{docPropertyName}\" ",
+            "if" => BuildIfFieldInstruction(properties),
+            // CONSISTENCY(field-add-symmetry): WordBatchEmitter.BuildFieldAddProps
+            // emits legacy form fields with fieldType=FORMTEXT / FORMCHECKBOX
+            // / FORMDROPDOWN. Without these arms the default arm threw
+            // `Unknown field type 'formtext'`, breaking dump→batch round-trips
+            // of any document containing a legacy form field. Delegate to
+            // AddFormField (the canonical /formfield handler) which builds
+            // the full FieldChar/FormFieldData/Bookmark chain.
+            "formtext" => "__FORMFIELD_DELEGATE__",
+            "formcheckbox" => "__FORMFIELD_DELEGATE__",
+            "formdropdown" => "__FORMFIELD_DELEGATE__",
+            // CONSISTENCY(field-add-symmetry): WordBatchEmitter.BuildFieldAddProps
+            // emits HYPERLINK fields as fieldType=HYPERLINK + url/anchor (+ text),
+            // never as a raw `instr`. Without a hyperlink case the default arm
+            // throws `Unknown field type 'hyperlink'` and (under the new
+            // continue-on-error default) the link is silently dropped on
+            // dump→batch round-trips of complex-field HYPERLINK chains.
+            "hyperlink" => BuildHyperlinkFieldInstruction(properties),
+            // CONSISTENCY(canonical-keys): field.json declares `instr` as
+            // the canonical raw-instruction key with `instruction` and
+            // `code` as aliases. Help docs and AI prompts use `instr=`
+            // (matching the readback key Get surfaces); accept all three.
+            _ => GetRawFieldInstruction(properties)
+                ?? throw new ArgumentException($"Unknown field type '{effectiveType}'. Provide a known type or an 'instr' / 'instruction' / 'code' property.")
+        };
+        // Form-field delegation: dump emits legacy form fields with
+        // fieldType=FORMTEXT/FORMCHECKBOX/FORMDROPDOWN. Route to AddFormField
+        // (the canonical /formfield handler) which builds the FieldChar +
+        // FormFieldData + Bookmark chain. Map fieldType → formfieldtype.
+        if (fieldInstr == "__FORMFIELD_DELEGATE__")
+        {
+            var ffProps = new Dictionary<string, string>(properties, StringComparer.OrdinalIgnoreCase);
+            ffProps["formfieldtype"] = effectiveType switch
+            {
+                "formcheckbox" => "checkbox",
+                "formdropdown" => "dropdown",
+                _ => "text",
+            };
+            return AddFormField(parent, parentPath, index, ffProps);
+        }
+
+        // Allow override via property — same alias set as the no-fieldType path.
+        var rawInstr = GetRawFieldInstruction(properties);
+        if (rawInstr != null)
+            fieldInstr = rawInstr.StartsWith(" ") ? rawInstr : $" {rawInstr} ";
+
+        // CONSISTENCY(field-prop-applicability): the schema in field.json
+        // declares per-fieldType-specific props (expression/trueText/
+        // falseText for IF, identifier for SEQ, hyperlink for REF, etc.)
+        // as universal field-level keys for ergonomic CLI completion.
+        // Warn on stderr when a prop that only matters for one fieldType
+        // is supplied alongside a different fieldType — Add was silently
+        // dropping these per-type props without feedback (Round 5 audit).
+        WarnInapplicableFieldProps(properties, effectiveType);
+
+        var fieldPlaceholder = properties.ContainsKey("text")
+            ? properties["text"]
+            : effectiveType switch
+            {
+                "mergefield" => $"\u00AB{mergeFieldName}\u00BB",
+                "ref" or "noteref" => $"\u00AB{refBookmarkName}\u00BB",
+                "styleref" => $"\u00AB{styleRefName}\u00BB",
+                "docproperty" => $"\u00AB{docPropertyName}\u00BB",
+                "if" => properties.GetValueOrDefault("trueText", ""),
+                // DATE/TIME family: seed with DateTime.Now formatted via the
+                // user's `\@` format switch (if any), otherwise Word-like
+                // defaults. The "1" fallback for unrecognized fields is
+                // correct for PAGE / NUMPAGES / SECTION etc. but produced
+                // a meaningless "1" placeholder for date/time before Word
+                // recalculated on open (R11 minor).
+                "date" or "createdate" or "savedate" or "printdate"
+                    => FormatDateForField(dateFmtVal, "M/d/yyyy"),
+                "time" => FormatDateForField(dateFmtVal, "h:mm tt"),
+                _ => "1"
+            };
+
+        // Build complex field. Canonical shape:
+        //   fldChar(begin) + instrText + fldChar(separate) + result + fldChar(end)
+        // When the caller passes `noSeparator=true` (typically dump→batch
+        // replay of a source whose original field had no separator+result
+        // runs), drop fldChar(separate) and the result run — Word treats
+        // separator-less fields as "field will be recomputed on open" and
+        // renders identically while preserving the source's structural
+        // shape on round-trip.
+        bool fieldNoSeparator = (properties.TryGetValue("noseparator", out var nsv)
+                              || properties.TryGetValue("noSeparator", out nsv))
+                              && IsTruthy(nsv);
+        var fieldRunBegin = new Run(new FieldChar { FieldCharType = FieldCharValues.Begin });
+        var fieldRunInstr = new Run(new FieldCode(fieldInstr) { Space = SpaceProcessingModeValues.Preserve });
+        var fieldRunSep = fieldNoSeparator
+            ? null
+            : new Run(new FieldChar { FieldCharType = FieldCharValues.Separate });
+        var fieldRunResult = fieldNoSeparator
+            ? null
+            : new Run(new Text(fieldPlaceholder) { Space = SpaceProcessingModeValues.Preserve });
+        var fieldRunEnd = new Run(new FieldChar { FieldCharType = FieldCharValues.End });
+
+        // Apply optional run formatting to all runs
+        RunProperties? fieldRProps = null;
+        if (properties.TryGetValue("font", out var fFont) || properties.TryGetValue("size", out _) ||
+            properties.TryGetValue("bold", out _) || properties.TryGetValue("color", out _))
+        {
+            fieldRProps = new RunProperties();
+            // CT_RPr schema order: rFonts → b → ... → color → sz
+            if (properties.TryGetValue("font", out var ff))
+                fieldRProps.AppendChild(new RunFonts { Ascii = ff, HighAnsi = ff, EastAsia = ff });
+            if (properties.TryGetValue("bold", out var fb) && IsTruthy(fb))
+                fieldRProps.AppendChild(new Bold());
+            if (properties.TryGetValue("color", out var fc))
+                fieldRProps.AppendChild(new Color { Val = SanitizeHex(fc) });
+            if (properties.TryGetValue("size", out var fs))
+                fieldRProps.AppendChild(new FontSize { Val = ((int)Math.Round(ParseFontSize(fs) * 2, MidpointRounding.AwayFromZero)).ToString() });
+        }
+
+        // Final emitted-run ordering: begin → instr → [separate → result] → end
+        // (the bracketed pair is skipped when noSeparator=true). Collect in
+        // a list so the insertion-site code below doesn't have to repeat the
+        // separator-aware conditional.
+        var fieldRuns = new List<Run> { fieldRunBegin, fieldRunInstr };
+        if (fieldRunSep != null) fieldRuns.Add(fieldRunSep);
+        if (fieldRunResult != null) fieldRuns.Add(fieldRunResult);
+        fieldRuns.Add(fieldRunEnd);
+        // pathRun is what `resultPath` will index to. With separator: the
+        // result run (carrying the cached text). Without: end run (no result
+        // node exists; pointing at end is the closest stable anchor).
+        var pathRun = fieldRunResult ?? fieldRunEnd;
+
+        if (fieldRProps != null)
+        {
+            foreach (var fr in fieldRuns)
+                fr.PrependChild(fieldRProps.CloneNode(true));
+        }
+
+        string resultPath;
+        if (parent is Paragraph fieldPara)
+        {
+            // CONSISTENCY(para-path-canonical): canonicalize parentPath to
+            // paraId-form so the returned path mirrors what Get later
+            // surfaces (paraId is globally unique, works in body / header /
+            // footer / cell alike).
+            var fieldParaPath = ReplaceTrailingParaSegment(parentPath, fieldPara);
+            // CONSISTENCY(paraid-textid-refresh): mirror AddRun — bump
+            // textId because the paragraph's content sequence is changing.
+            fieldPara.TextId = GenerateParaId();
+            // index is a childElement-index (ResolveAnchorPosition counts pPr too).
+            // Route the 5 field runs through the pPr-aware multi-insert helper
+            // so index 0 clamps forward past ParagraphProperties and they stay
+            // in the correct consecutive order.
+            if (index.HasValue)
+            {
+                InsertIntoParagraph(
+                    fieldPara,
+                    fieldRuns.Cast<OpenXmlElement>().ToArray(),
+                    index);
+                var runIdxAfterInsert = GetAllRuns(fieldPara).IndexOf(pathRun);
+                resultPath = $"{fieldParaPath}/r[{runIdxAfterInsert + 1}]";
+            }
+            else
+            {
+                foreach (var fr in fieldRuns) fieldPara.AppendChild(fr);
+                var runs = GetAllRuns(fieldPara);
+                var runIdx = runs.IndexOf(pathRun) + 1;
+                resultPath = $"{fieldParaPath}/r[{runIdx}]";
+            }
+        }
+        else if (parent is Hyperlink fieldHl && fieldHl.Parent is Paragraph fieldHlPara)
+        {
+            // BUG-DUMP18-02: field added with parent=w:hyperlink. The 5 field
+            // runs become direct children of the hyperlink so they render
+            // INSIDE the hyperlink scope (mirrors AddEquation's Hyperlink
+            // branch added in BUG-DUMP15-04).
+            fieldHlPara.TextId = GenerateParaId();
+            if (index.HasValue)
+            {
+                var children = fieldHl.ChildElements.ToList();
+                if (index.Value < children.Count)
+                {
+                    var anchor = children[index.Value];
+                    foreach (var r in fieldRuns) anchor.InsertBeforeSelf(r);
+                }
+                else
+                {
+                    foreach (var r in fieldRuns) fieldHl.AppendChild(r);
+                }
+            }
+            else
+            {
+                foreach (var r in fieldRuns) fieldHl.AppendChild(r);
+            }
+            var fieldHlParaPath = ReplaceTrailingParaSegment(parentPath, fieldHlPara);
+            var slashIdxHl = fieldHlParaPath.LastIndexOf("/hyperlink[", StringComparison.Ordinal);
+            var paraPathOnly = slashIdxHl > 0 ? fieldHlParaPath.Substring(0, slashIdxHl) : fieldHlParaPath;
+            var hlIdxF = fieldHlPara.Elements<Hyperlink>().TakeWhile(h => !ReferenceEquals(h, fieldHl)).Count() + 1;
+            var runIdxAfter = GetAllRuns(fieldHlPara).IndexOf(pathRun);
+            resultPath = $"{paraPathOnly}/hyperlink[{hlIdxF}]/r[{runIdxAfter + 1}]";
+        }
+        else if (parent is Run hostRun && hostRun.Parent is Paragraph hostRunPara)
+        {
+            hostRunPara.TextId = GenerateParaId();
+            OpenXmlElement cursor = hostRun;
+            foreach (var fr in fieldRuns)
+            {
+                cursor.InsertAfterSelf(fr);
+                cursor = fr;
+            }
+            var hostParaPath = ReplaceTrailingParaSegment(parentPath, hostRunPara);
+            var slashIdx = hostParaPath.LastIndexOf("/r[", StringComparison.Ordinal);
+            if (slashIdx > 0) hostParaPath = hostParaPath.Substring(0, slashIdx);
+            var runIdxAfter = GetAllRuns(hostRunPara).IndexOf(pathRun);
+            resultPath = $"{hostParaPath}/r[{runIdxAfter + 1}]";
+        }
+        else
+        {
+            // Create a new paragraph containing the field
+            var fNewPara = new Paragraph();
+            var fPProps = new ParagraphProperties();
+            if (properties.TryGetValue("align", out var fAlign) || properties.TryGetValue("alignment", out fAlign))
+                fPProps.Justification = new Justification { Val = ParseJustification(fAlign) };
+            fNewPara.AppendChild(fPProps);
+            foreach (var fr in fieldRuns) fNewPara.AppendChild(fr);
+            // CONSISTENCY(paraid-global-uniqueness): newly-created paragraphs
+            // get a paraId from the global counter so they remain addressable
+            // by paraId regardless of which container they land in.
+            AssignParaId(fNewPara);
+            InsertAtIndexOrAppend(parent, fNewPara, index);
+            // CONSISTENCY(para-path-canonical): paraId-form path works in
+            // every container (body / header / footer / cell). Same shape
+            // as AddBreak's new-paragraph branch.
+            if (parent is Body)
+            {
+                var fIdx2 = body.Elements<Paragraph>().TakeWhile(p => p != fNewPara).Count();
+                resultPath = $"/body/{BuildParaPathSegment(fNewPara, fIdx2 + 1)}";
+            }
+            else
+            {
+                var fIdx2 = parent.Elements<Paragraph>().TakeWhile(p => p != fNewPara).Count();
+                resultPath = $"{parentPath}/{BuildParaPathSegment(fNewPara, fIdx2 + 1)}";
+            }
+        }
+        return resultPath;
+    }
+
+    // CONSISTENCY(canonical-keys): the raw field instruction can be passed
+    // under `instr` (canonical, mirrors Get readback), `instruction`
+    // (legacy, predates the schema rename), or `code` (alias documented in
+    // field.json). All three resolve to the same string. Wrapping spaces
+    // are reserved by the caller — the wrapping logic at the call site
+    // adds them when missing.
+    private static string? GetRawFieldInstruction(Dictionary<string, string> properties)
+    {
+        // Treat empty / whitespace-only as absent so a placeholder
+        // `instr=""` doesn't short-circuit the alias chain and emit a
+        // degenerate empty <w:instrText> while a non-empty `instruction=`
+        // or `code=` is also supplied. Found via Round 7 fuzz BUG-R7-3.
+        static string? NotBlank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s;
+        return NotBlank(properties.GetValueOrDefault("instr"))
+            ?? NotBlank(properties.GetValueOrDefault("instruction"))
+            ?? NotBlank(properties.GetValueOrDefault("code"));
+    }
+
+    // CONSISTENCY(field-prop-applicability): map each fieldType to the
+    // per-type props the Add path actually reads. Anything outside the
+    // universal set + this map's value is unused for that fieldType and
+    // should surface as a warning so the user notices the typo / wrong
+    // assumption (e.g. supplying bookmarkName=... with fieldType=if).
+    private static readonly Dictionary<string, string[]> FieldTypeProps =
+        new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["mergefield"] = new[] { "name", "fieldname", "switches" },
+        ["ref"] = new[] { "name", "fieldname", "bookmarkname", "bookmark", "hyperlink" },
+        ["pageref"] = new[] { "name", "fieldname", "bookmarkname", "bookmark", "hyperlink" },
+        ["noteref"] = new[] { "name", "fieldname", "bookmarkname", "bookmark", "hyperlink" },
+        ["seq"] = new[] { "identifier", "id", "name", "switches" },
+        ["styleref"] = new[] { "stylename", "name" },
+        ["docproperty"] = new[] { "propertyname", "name" },
+        ["if"] = new[] { "expression", "condition", "truetext", "falsetext" },
+        ["date"] = new[] { "format" },
+        ["time"] = new[] { "format" },
+        ["createdate"] = new[] { "format" },
+        ["savedate"] = new[] { "format" },
+        ["printdate"] = new[] { "format" },
+        ["hyperlink"] = new[] { "url", "anchor" },
+    };
+
+    // Universal props every fieldType accepts: routing keys, run rPr,
+    // raw-instruction override, anchor placement, cached display text.
+    private static readonly HashSet<string> FieldUniversalProps =
+        new(StringComparer.OrdinalIgnoreCase)
+    {
+        "fieldtype", "type", "instr", "instruction", "code",
+        "text", "font", "size", "bold", "color",
+        "index", "after", "before",
+    };
+
+    // Render today's DateTime for the result-run placeholder of a DATE/TIME
+    // field. `userFormat` is the value of --prop format=… (the same string
+    // Word writes after \@ in the field instruction); empty/missing falls
+    // back to a Word-like default. Invalid format strings degrade silently
+    // to the default rather than throwing — the seeded value is cosmetic
+    // (Word recalculates on open), so a malformed format string would only
+    // be visible briefly and shouldn't fail the Add.
+    private static string FormatDateForField(string? userFormat, string defaultFormat)
+    {
+        var fmt = string.IsNullOrWhiteSpace(userFormat) ? defaultFormat : userFormat;
+        try
+        {
+            return DateTime.Now.ToString(fmt, System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch (FormatException)
+        {
+            return DateTime.Now.ToString(defaultFormat, System.Globalization.CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static void WarnInapplicableFieldProps(
+        Dictionary<string, string> properties, string effectiveType)
+    {
+        var typeProps = FieldTypeProps.GetValueOrDefault(effectiveType)
+            ?? Array.Empty<string>();
+        var typeSet = new HashSet<string>(typeProps, StringComparer.OrdinalIgnoreCase);
+        foreach (var key in properties.Keys)
+        {
+            if (FieldUniversalProps.Contains(key)) continue;
+            if (typeSet.Contains(key)) continue;
+            // Any other prop is known to no fieldType-specific consumer —
+            // the BuildXxxFieldInstruction path won't read it. Surface a
+            // warning so silent-ignore (Round 5 R5-T1 / R5-F2) becomes
+            // visible. Use stderr, exit code stays 0 (consistent with
+            // other Add warning paths via Console.Error.WriteLine).
+            Console.Error.WriteLine(
+                $"Warning: prop '{key}' is not applicable to field type '{effectiveType}' — silently ignored. " +
+                $"Applicable to '{effectiveType}': {(typeProps.Length > 0 ? string.Join(", ", typeProps) : "none beyond universal")}.");
+        }
+    }
+
+    // BUG-DUMP15-02: HYPERLINK fields may carry any combination of base URL,
+    // `\l "anchor"`, and `\o "tooltip"`. Reconstruct the full instruction
+    // from whichever props are present so dump→batch round-trips do not
+    // silently drop URL or tooltip.
+    private static string BuildHyperlinkFieldInstruction(Dictionary<string, string> properties)
+    {
+        properties.TryGetValue("url", out var hUrl);
+        properties.TryGetValue("anchor", out var hAnchor);
+        properties.TryGetValue("tooltip", out var hTooltip);
+        if (string.IsNullOrEmpty(hUrl) && string.IsNullOrEmpty(hAnchor))
+            throw new ArgumentException(
+                "HYPERLINK field requires either 'url' or 'anchor' property.");
+        var sb = new System.Text.StringBuilder(" HYPERLINK");
+        if (!string.IsNullOrEmpty(hUrl)) sb.Append($" \"{hUrl}\"");
+        if (!string.IsNullOrEmpty(hAnchor)) sb.Append($" \\l \"{hAnchor}\"");
+        if (!string.IsNullOrEmpty(hTooltip)) sb.Append($" \\o \"{hTooltip}\"");
+        sb.Append(' ');
+        return sb.ToString();
+    }
+
+    private static string BuildIfFieldInstruction(Dictionary<string, string> properties)
+    {
+        var expression = properties.GetValueOrDefault("expression")
+                      ?? properties.GetValueOrDefault("condition");
+        if (string.IsNullOrWhiteSpace(expression))
+            throw new ArgumentException("IF requires an 'expression' property (e.g. --prop expression=\"MERGEFIELD Gender = \\\"Male\\\"\").");
+        var trueText = properties.GetValueOrDefault("trueText", properties.GetValueOrDefault("truetext", ""));
+        var falseText = properties.GetValueOrDefault("falseText", properties.GetValueOrDefault("falsetext", ""));
+        return $" IF {expression} \"{trueText}\" \"{falseText}\" ";
+    }
+
+    private string AddBreak(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties, string type)
+    {
+        var body = _doc.MainDocumentPart?.Document?.Body
+            ?? throw new InvalidOperationException("Document body not found");
+
+        // Insert an explicit page break, column break, or line break
+        var breakType = type.ToLowerInvariant() switch
+        {
+            "columnbreak" => BreakValues.Column,
+            _ => BreakValues.Page
+        };
+        // CONSISTENCY(canonical-keys): accept both `type=` (legacy alias)
+        // and `breakType=` (Set/Get canonical key) on Add — silent-ignore
+        // of breakType= violates project red line (commit 19b3dd5b);
+        // forcing users to know that Add wants `type` while Set/Get want
+        // `breakType` is precisely the alias trap that policy bans.
+        if (properties.TryGetValue("type", out var brType)
+            || properties.TryGetValue("breakType", out brType)
+            || properties.TryGetValue("breaktype", out brType))
+        {
+            breakType = brType.ToLowerInvariant() switch
+            {
+                "page" => BreakValues.Page,
+                "column" => BreakValues.Column,
+                "textwrapping" or "line" => BreakValues.TextWrapping,
+                _ => throw new ArgumentException($"Invalid break type: '{brType}'. Valid values: page, column, line, textwrapping.")
+            };
+        }
+
+        var brk = new Break { Type = breakType };
+        var brkRun = new Run(brk);
+
+        string resultPath;
+        if (parent is Paragraph brkPara)
+        {
+            // CONSISTENCY(paraid-textid-refresh): mirror AddRun — bump
+            // textId so revision/diff tooling sees the paragraph as
+            // modified. Done before we possibly take an early return on
+            // the index-resolved path to make sure both branches stamp it.
+            brkPara.TextId = GenerateParaId();
+            // index is a childElement-index (ResolveAnchorPosition counts pPr).
+            // pPr-aware insert keeps pPr as the first child of <w:p>.
+            InsertIntoParagraph(brkPara, brkRun, index);
+            var brkRunIdx = GetAllRuns(brkPara).IndexOf(brkRun) + 1;
+            // CONSISTENCY(para-path-canonical): parentPath already targets
+            // the paragraph; replacing its trailing /p[...] segment with
+            // paraId-form yields a path that mirrors what Get later
+            // surfaces and works regardless of which container the
+            // paragraph lives in (body / header / footer / cell). The
+            // previous /body/-hardcoded path produced wrong prefixes for
+            // breaks added inside header/footer paragraphs.
+            var canonicalParaPath = ReplaceTrailingParaSegment(parentPath, brkPara);
+            resultPath = $"{canonicalParaPath}/r[{brkRunIdx}]";
+        }
+        else
+        {
+            // Create a new empty paragraph with the break and insert into the
+            // ACTUAL parent (not hard-coded body) so /header[N], /footer[N],
+            // table cells, etc. receive the new paragraph. /styles is blocked
+            // earlier by ValidateParentChild.
+            var brkNewPara = new Paragraph(brkRun);
+            // CONSISTENCY(paraid-global-uniqueness): every newly-created
+            // paragraph gets a paraId so it remains addressable by paraId
+            // across containers (body / headers / footers / cells); the
+            // global counter guarantees uniqueness so the same path form
+            // works everywhere.
+            AssignParaId(brkNewPara);
+            InsertAtIndexOrAppend(parent, brkNewPara, index);
+            // CONSISTENCY(para-path-canonical): paraId-form is valid in
+            // every container (the paraId is globally unique and Navigation
+            // resolves it inside header/footer/cell parts as well as body).
+            // Use the same BuildParaPathSegment helper everywhere instead
+            // of a body-only specialization.
+            if (parent is Body)
+            {
+                var brkIdx = body.Elements<Paragraph>().TakeWhile(p => p != brkNewPara).Count();
+                resultPath = $"/body/{BuildParaPathSegment(brkNewPara, brkIdx + 1)}";
+            }
+            else
+            {
+                var brkIdx = parent.Elements<Paragraph>().TakeWhile(p => p != brkNewPara).Count();
+                resultPath = $"{parentPath}/{BuildParaPathSegment(brkNewPara, brkIdx + 1)}";
+            }
+        }
+        return resultPath;
+    }
+
+    private string AddSdt(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
+    {
+        var body = _doc.MainDocumentPart?.Document?.Body
+            ?? throw new InvalidOperationException("Document body not found");
+
+        // Case-insensitive lookup to support camelCase keys like "sdtType", "controlType", etc.
+        var ciProps = new Dictionary<string, string>(properties, StringComparer.OrdinalIgnoreCase);
+
+        // Add a Structured Document Tag (Content Control)
+        // Canonical key is "type" (per schemas/help/docx/sdt.json); "sdttype" / "controltype"
+        // retained as legacy aliases for backward-compat.
+        var sdtType = ciProps.GetValueOrDefault("type",
+            ciProps.GetValueOrDefault("sdttype",
+                ciProps.GetValueOrDefault("controltype", "text"))).ToLowerInvariant();
+        // Schema-honesty: reject values the SDT builder does not emit the
+        // correct child elements for. Keeps the schema and runtime in sync
+        // instead of silently falling back to plain-text SDT.
+        var supportedSdtTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "text", "plaintext", "richtext", "rich",
+            "dropdown", "dropdownlist", "combobox", "combo",
+            "date", "datepicker"
+        };
+        if (!supportedSdtTypes.Contains(sdtType))
+            throw new NotSupportedException(
+                $"SDT type '{sdtType}' is not implemented. Supported: text, richtext, dropdown, combobox, date. " +
+                "Create the content control in Word, then edit via CLI.");
+        var alias = ciProps.GetValueOrDefault("alias", ciProps.GetValueOrDefault("name", ""));
+        var tag = ciProps.GetValueOrDefault("tag", "");
+        var lockVal = ciProps.GetValueOrDefault("lock", "");
+        var sdtText = ciProps.GetValueOrDefault("text", "");
+
+        // Determine block-level vs inline
+        bool isInline = parent is Paragraph;
+
+        string resultPath;
+        if (isInline)
+        {
+            // Inline SDT (SdtRun) inside a paragraph
+            var sdtRun = new SdtRun();
+            var sdtProps = new SdtProperties();
+
+            // ID
+            var inlineSdtIdVal = NextSdtId();
+            sdtProps.AppendChild(new SdtId { Val = inlineSdtIdVal });
+
+            if (!string.IsNullOrEmpty(alias))
+                sdtProps.AppendChild(new SdtAlias { Val = alias });
+            if (!string.IsNullOrEmpty(tag))
+                sdtProps.AppendChild(new Tag { Val = tag });
+            if (!string.IsNullOrEmpty(lockVal))
+            {
+                sdtProps.AppendChild(new DocumentFormat.OpenXml.Wordprocessing.Lock
+                {
+                    Val = lockVal.ToLowerInvariant() switch
+                    {
+                        "contentlocked" or "content" => LockingValues.ContentLocked,
+                        "sdtlocked" or "sdt" => LockingValues.SdtLocked,
+                        "sdtcontentlocked" or "both" => LockingValues.SdtContentLocked,
+                        "unlocked" or "none" => LockingValues.Unlocked,
+                        _ => throw new ArgumentException($"Invalid lock value: '{lockVal}'. Valid values: unlocked, contentLocked, sdtLocked, sdtContentLocked.")
+                    }
+                });
+            }
+
+            // Content type definition
+            switch (sdtType)
+            {
+                case "dropdown" or "dropdownlist":
+                {
+                    var ddl = new SdtContentDropDownList();
+                    if (ciProps.TryGetValue("items", out var items))
+                    {
+                        foreach (var li in ParseSdtItems(items))
+                            ddl.AppendChild(li);
+                    }
+                    sdtProps.AppendChild(ddl);
+                    break;
+                }
+                case "combobox" or "combo":
+                {
+                    var cb = new SdtContentComboBox();
+                    if (ciProps.TryGetValue("items", out var items))
+                    {
+                        foreach (var li in ParseSdtItems(items))
+                            cb.AppendChild(li);
+                    }
+                    sdtProps.AppendChild(cb);
+                    break;
+                }
+                case "date" or "datepicker":
+                    var datePr = new SdtContentDate();
+                    if (ciProps.TryGetValue("format", out var dateFmt))
+                        datePr.DateFormat = new DateFormat { Val = dateFmt };
+                    else
+                        datePr.DateFormat = new DateFormat { Val = "yyyy-MM-dd" };
+                    sdtProps.AppendChild(datePr);
+                    break;
+                case "richtext" or "rich":
+                    // Rich text has no specific type element (absence of w:text means rich text)
+                    break;
+                default: // "text" or "plaintext"
+                    sdtProps.AppendChild(new SdtContentText());
+                    break;
+            }
+
+            sdtRun.AppendChild(sdtProps);
+            var sdtContent = new SdtContentRun();
+            var contentRun = new Run(new Text(sdtText) { Space = SpaceProcessingModeValues.Preserve });
+
+            // CONSISTENCY(rtl-cascade): mirror AddRun (Add.Text.cs:373-376).
+            // When the host paragraph is direction=rtl (pPr/bidi or mark
+            // rPr/rtl), the new contentRun must carry rPr/rtl — paragraph
+            // mark rPr does not cascade to inner runs in OOXML; only style
+            // does. Without this, SDT body in an RTL paragraph renders LTR.
+            if (parent is Paragraph hostPara && hostPara.ParagraphProperties is { } hostPPr)
+            {
+                var hostBidi = hostPPr.GetFirstChild<BiDi>();
+                var hostMarkRtl = hostPPr.ParagraphMarkRunProperties?
+                    .GetFirstChild<RightToLeftText>();
+                if (hostBidi != null || hostMarkRtl != null)
+                {
+                    var crProps = contentRun.RunProperties ??= new RunProperties();
+                    if (crProps.GetFirstChild<RightToLeftText>() == null)
+                        crProps.AppendChild(new RightToLeftText());
+                }
+            }
+            sdtContent.AppendChild(contentRun);
+            sdtRun.AppendChild(sdtContent);
+
+            // index is a childElement-index (ResolveAnchorPosition counts pPr).
+            // pPr-aware insert so an index at pPr clamps forward to keep pPr first.
+            var sdtPara = (Paragraph)parent;
+            InsertIntoParagraph(sdtPara, sdtRun, index);
+            // Build stable @paraId= and @sdtId= based path. Determine the
+            // root segment (body / header[N] / footer[N]) from the caller's
+            // parentPath so returned paths actually resolve when the parent
+            // paragraph lives in a header or footer part.
+            var inlineRoot = ExtractRootSegment(parentPath);
+            var inlineParaId = ((Paragraph)parent).ParagraphId?.Value;
+            string inlineParaSegment;
+            if (!string.IsNullOrEmpty(inlineParaId))
+            {
+                inlineParaSegment = $"p[@paraId={inlineParaId}]";
+            }
+            else
+            {
+                var parentContainer = parent.Parent;
+                var paraIdxIn = parentContainer?.Elements<Paragraph>().TakeWhile(p => p != parent).Count() ?? 0;
+                inlineParaSegment = $"p[{paraIdxIn + 1}]";
+            }
+            resultPath = $"{inlineRoot}/{inlineParaSegment}/sdt[@sdtId={inlineSdtIdVal}]";
+        }
+        else
+        {
+            // Block-level SDT (SdtBlock)
+            var sdtBlock = new SdtBlock();
+            var sdtProps = new SdtProperties();
+
+            sdtProps.AppendChild(new SdtId { Val = NextSdtId() });
+
+            if (!string.IsNullOrEmpty(alias))
+                sdtProps.AppendChild(new SdtAlias { Val = alias });
+            if (!string.IsNullOrEmpty(tag))
+                sdtProps.AppendChild(new Tag { Val = tag });
+            if (!string.IsNullOrEmpty(lockVal))
+            {
+                sdtProps.AppendChild(new DocumentFormat.OpenXml.Wordprocessing.Lock
+                {
+                    Val = lockVal.ToLowerInvariant() switch
+                    {
+                        "contentlocked" or "content" => LockingValues.ContentLocked,
+                        "sdtlocked" or "sdt" => LockingValues.SdtLocked,
+                        "sdtcontentlocked" or "both" => LockingValues.SdtContentLocked,
+                        "unlocked" or "none" => LockingValues.Unlocked,
+                        _ => throw new ArgumentException($"Invalid lock value: '{lockVal}'. Valid values: unlocked, contentLocked, sdtLocked, sdtContentLocked.")
+                    }
+                });
+            }
+
+            switch (sdtType)
+            {
+                case "dropdown" or "dropdownlist":
+                {
+                    var ddl = new SdtContentDropDownList();
+                    if (ciProps.TryGetValue("items", out var items))
+                    {
+                        foreach (var li in ParseSdtItems(items))
+                            ddl.AppendChild(li);
+                    }
+                    sdtProps.AppendChild(ddl);
+                    break;
+                }
+                case "combobox" or "combo":
+                {
+                    var cb = new SdtContentComboBox();
+                    if (ciProps.TryGetValue("items", out var items))
+                    {
+                        foreach (var li in ParseSdtItems(items))
+                            cb.AppendChild(li);
+                    }
+                    sdtProps.AppendChild(cb);
+                    break;
+                }
+                case "date" or "datepicker":
+                    var datePr = new SdtContentDate();
+                    if (ciProps.TryGetValue("format", out var dateFmt))
+                        datePr.DateFormat = new DateFormat { Val = dateFmt };
+                    else
+                        datePr.DateFormat = new DateFormat { Val = "yyyy-MM-dd" };
+                    sdtProps.AppendChild(datePr);
+                    break;
+                case "richtext" or "rich":
+                    break;
+                default:
+                    sdtProps.AppendChild(new SdtContentText());
+                    break;
+            }
+
+            sdtBlock.AppendChild(sdtProps);
+            var sdtContent = new SdtContentBlock();
+            var contentPara = new Paragraph(new Run(new Text(sdtText) { Space = SpaceProcessingModeValues.Preserve }));
+            sdtContent.AppendChild(contentPara);
+            sdtBlock.AppendChild(sdtContent);
+
+            InsertAtIndexOrAppend(parent, sdtBlock, index);
+            // Root-aware path: the sdtBlock may have been inserted into a
+            // header/footer; count SdtBlock siblings under its actual parent
+            // and prefix with the correct root segment.
+            var blockRoot = ExtractRootSegment(parentPath);
+            var blockSiblingCount = parent.Elements<SdtBlock>().TakeWhile(s => s != sdtBlock).Count() + 1;
+            resultPath = parent is Body
+                ? $"{blockRoot}/sdt[{blockSiblingCount}]"
+                : $"{parentPath}/sdt[{blockSiblingCount}]";
+        }
+        return resultPath;
+    }
+
+    private string AddWatermark(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
+    {
+        var wmText = properties.GetValueOrDefault("text", "DRAFT");
+        // VML watermarks accept named colors (silver, red, etc.) or hex — don't sanitize
+        var wmColor = properties.TryGetValue("color", out var wmcVal)
+            ? wmcVal.TrimStart('#') : "silver";
+        var wmFont = properties.GetValueOrDefault("font", OfficeDefaultFonts.MinorLatin);
+        var wmSize = properties.GetValueOrDefault("size", "1pt");
+        if (!wmSize.EndsWith("pt")) wmSize += "pt";
+        var wmRotation = properties.GetValueOrDefault("rotation", "315");
+        var wmOpacity = properties.TryGetValue("opacity", out var wmoVal) ? wmoVal : ".5";
+        var wmWidth = properties.GetValueOrDefault("width", "415pt");
+        var wmHeight = properties.GetValueOrDefault("height", "207.5pt");
+
+        var mainPartWM = _doc.MainDocumentPart!;
+
+        // Remove existing watermarks first
+        RemoveWatermarkHeaders();
+
+        // Create 3 headers (default, first, even) — same as POI's createWatermark()
+        var headerTypes = new[] {
+            HeaderFooterValues.Default,
+            HeaderFooterValues.First,
+            HeaderFooterValues.Even
+        };
+
+        for (int wi = 0; wi < 3; wi++)
+        {
+            var wmHeaderPart = mainPartWM.AddNewPart<HeaderPart>();
+            var wmIdx = wi + 1;
+
+            // Build VML watermark XML (follows POI's getWatermarkParagraph template)
+            var vmlXml = $@"<v:shapetype id=""_x0000_t136"" coordsize=""1600,21600"" o:spt=""136"" adj=""10800"" path=""m@7,0l@8,0m@5,21600l@6,21600e"" xmlns:v=""urn:schemas-microsoft-com:vml"" xmlns:o=""urn:schemas-microsoft-com:office:office"">
+  <v:formulas>
+    <v:f eqn=""sum #0 0 10800""/><v:f eqn=""prod #0 2 1""/><v:f eqn=""sum 21600 0 @1""/>
+    <v:f eqn=""sum 0 0 @2""/><v:f eqn=""sum 21600 0 @3""/><v:f eqn=""if @0 @3 0""/>
+    <v:f eqn=""if @0 21600 @1""/><v:f eqn=""if @0 0 @2""/><v:f eqn=""if @0 @4 21600""/>
+    <v:f eqn=""mid @5 @6""/><v:f eqn=""mid @8 @5""/><v:f eqn=""mid @7 @8""/>
+    <v:f eqn=""mid @6 @7""/><v:f eqn=""sum @6 0 @5""/>
+  </v:formulas>
+  <v:path textpathok=""t"" o:connecttype=""custom"" o:connectlocs=""@9,0;@10,10800;@11,21600;@12,10800"" o:connectangles=""270,180,90,0""/>
+  <v:textpath on=""t"" fitshape=""t""/>
+  <v:handles><v:h position=""#0,bottomRight"" xrange=""6629,14971""/></v:handles>
+  <o:lock v:ext=""edit"" text=""t"" shapetype=""t""/>
+</v:shapetype>
+<v:shape id=""PowerPlusWaterMarkObject{wmIdx}"" o:spid=""_x0000_s102{4 + wmIdx}"" type=""#_x0000_t136"" style=""position:absolute;margin-left:0;margin-top:0;width:{wmWidth};height:{wmHeight};rotation:{wmRotation};z-index:-251654144;mso-wrap-edited:f;mso-position-horizontal:center;mso-position-horizontal-relative:margin;mso-position-vertical:center;mso-position-vertical-relative:margin"" o:allowincell=""f"" fillcolor=""{wmColor}"" stroked=""f"" xmlns:v=""urn:schemas-microsoft-com:vml"" xmlns:o=""urn:schemas-microsoft-com:office:office"">
+  <v:fill opacity=""{wmOpacity}""/>
+  <v:textpath style=""font-family:&quot;{System.Security.SecurityElement.Escape(wmFont)}&quot;;font-size:{wmSize}"" string=""{System.Security.SecurityElement.Escape(wmText)}""/>
+</v:shape>";
+
+            // Build header XML with SDT wrapper (docPartGallery=Watermarks)
+            var headerXml = $@"<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>
+<w:hdr xmlns:w=""http://schemas.openxmlformats.org/wordprocessingml/2006/main""
+       xmlns:r=""http://schemas.openxmlformats.org/officeDocument/2006/relationships""
+       xmlns:w10=""urn:schemas-microsoft-com:office:word"">
+  <w:sdt>
+    <w:sdtPr>
+      <w:id w:val=""{-1000 - wmIdx}""/>
+      <w:docPartObj>
+        <w:docPartGallery w:val=""Watermarks""/>
+        <w:docPartUnique/>
+      </w:docPartObj>
+    </w:sdtPr>
+    <w:sdtContent>
+      <w:p>
+        <w:pPr><w:pStyle w:val=""Header""/></w:pPr>
+        <w:r>
+          <w:rPr><w:noProof/></w:rPr>
+          <w:pict>{vmlXml}</w:pict>
+        </w:r>
+      </w:p>
+    </w:sdtContent>
+  </w:sdt>
+</w:hdr>";
+
+            using (var stream = wmHeaderPart.GetStream(System.IO.FileMode.Create))
+            using (var writer = new System.IO.StreamWriter(stream, System.Text.Encoding.UTF8))
+                writer.Write(headerXml);
+
+            // Link header to section properties
+            var wmBody = mainPartWM.Document!.Body!;
+            var wmSectPr = wmBody.Elements<SectionProperties>().LastOrDefault()
+                ?? wmBody.AppendChild(new SectionProperties());
+
+            // Remove existing header reference of same type
+            var existingRef = wmSectPr.Elements<HeaderReference>()
+                .FirstOrDefault(r => r.Type?.Value == headerTypes[wi]);
+            existingRef?.Remove();
+
+            wmSectPr.PrependChild(new HeaderReference
+            {
+                Id = mainPartWM.GetIdOfPart(wmHeaderPart),
+                Type = headerTypes[wi]
+            });
+        }
+
+        // Enable even/odd page headers and title page
+        var wmSettingsPart = mainPartWM.DocumentSettingsPart
+            ?? mainPartWM.AddNewPart<DocumentSettingsPart>();
+        wmSettingsPart.Settings ??= new Settings();
+        if (wmSettingsPart.Settings.GetFirstChild<EvenAndOddHeaders>() == null)
+            wmSettingsPart.Settings.AddChild(new EvenAndOddHeaders(), throwOnError: false);
+        var wmSectPrForTitle = mainPartWM.Document!.Body!.Elements<SectionProperties>().LastOrDefault()
+            ?? mainPartWM.Document!.Body!.AppendChild(new SectionProperties());
+        if (wmSectPrForTitle.GetFirstChild<TitlePage>() == null)
+            wmSectPrForTitle.AddChild(new TitlePage(), throwOnError: false);
+
+        return "/watermark";
+    }
+
+    private string AddDefault(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties, string type)
+    {
+        // Generic fallback: create typed element via SDK schema validation
+        var created = GenericXmlQuery.TryCreateTypedElement(parent, type, properties, index);
+        if (created == null)
+            throw new ArgumentException($"Unknown element type '{type}' for {parentPath}. " +
+                "Valid types: paragraph (p), run (r), table (tbl), row, cell, picture, chart, ole (object, embed), equation, comment, section, footnote, endnote, toc, style, watermark, bookmark, hyperlink, field, break, sdt, header, footer. " +
+                "Use 'officecli docx add' for details.");
+
+        var siblings = parent.ChildElements.Where(e => e.LocalName == created.LocalName).ToList();
+        var createdIdx = siblings.IndexOf(created) + 1;
+        var resultPath = $"{parentPath}/{created.LocalName}[{createdIdx}]";
+        return resultPath;
+    }
+
+    /// <summary>
+    /// Parse the SDT --prop items= argument into ListItem children.
+    /// BUG-R5-07: previously the comma-split tokens were used as both
+    /// displayText and value, which is fine for "Draft,Review,Final" but
+    /// erases the distinct value attribute that real Word documents use
+    /// ("Draft|DRAFT,Review|REVIEW,Final|FINAL"). dump emits this
+    /// pipe-separated form when DisplayText differs from Value; accept it
+    /// here so add round-trips correctly. A bare token (no `|`) keeps the
+    /// old behavior — display == value.
+    /// </summary>
+    // BUG-DUMP9-09: MERGEFIELD field names with whitespace must be quoted in
+    // the instruction so Word parses them as one token. Already-quoted input
+    // is left as-is so the instruction is idempotent under dump round-trip.
+    // Append the trailing-switches blob produced by WordBatchEmitter for SEQ /
+    // MERGEFIELD round-trips (e.g. `\* ARABIC \r 1`, `\* MERGEFORMAT`).
+    // Returns either an empty string or a single space + verbatim switches,
+    // so the caller can splice it directly between the identifier and the
+    // closing space. BUG-DUMP17-01 / BUG-DUMP17-02.
+    private static string AppendFieldSwitches(Dictionary<string, string>? properties)
+    {
+        if (properties == null) return "";
+        if (!properties.TryGetValue("switches", out var sw) || string.IsNullOrWhiteSpace(sw)) return "";
+        return " " + sw.Trim();
+    }
+
+    private static string QuoteFieldNameIfNeeded(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return name;
+        if (name.Length >= 2 && name[0] == '"' && name[^1] == '"') return name;
+        bool needs = false;
+        foreach (var ch in name)
+        {
+            if (char.IsWhiteSpace(ch) || ch == '"' || ch == '\\') { needs = true; break; }
+        }
+        if (!needs) return name;
+        var escaped = name.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        return $"\"{escaped}\"";
+    }
+
+    private static IEnumerable<ListItem> ParseSdtItems(string items)
+    {
+        foreach (var raw in items.Split(','))
+        {
+            var trimmed = raw.Trim();
+            if (string.IsNullOrEmpty(trimmed)) continue;
+            string display, value;
+            var pipeIdx = trimmed.IndexOf('|');
+            if (pipeIdx > 0)
+            {
+                display = trimmed[..pipeIdx].Trim();
+                value = trimmed[(pipeIdx + 1)..].Trim();
+            }
+            else
+            {
+                display = value = trimmed;
+            }
+            yield return new ListItem { DisplayText = display, Value = value };
+        }
+    }
+
+    // =====================================================================
+    // v5.7-cont: add type=textbox / add type=shape
+    // =====================================================================
+
+    private string AddTextbox(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
+    {
+        // Resolve target container: body is the canonical anchor; cell/header/
+        // footer are also legal (they all hold block-flow paragraphs).
+        var (host, hostRoot) = ResolveDrawingHost(parent, parentPath);
+        long cxEmu = ParseDrawingSize(properties.GetValueOrDefault("width"), defaultEmu: 2_286_000);  // ~6cm
+        long cyEmu = ParseDrawingSize(properties.GetValueOrDefault("height"), defaultEmu: 914_400);   // ~2.4cm
+        string wrap = properties.GetValueOrDefault("wrap", "square").ToLowerInvariant();
+        long hPos = ParseDrawingPos(properties, "anchor.x", "hposition", defaultEmu: 0);
+        long vPos = ParseDrawingPos(properties, "anchor.y", "vposition", defaultEmu: 0);
+        string? fillColor = properties.GetValueOrDefault("fill") ?? properties.GetValueOrDefault("fillcolor");
+        string? lineColor = properties.GetValueOrDefault("line.color") ?? properties.GetValueOrDefault("linecolor");
+        string? lineStyle = properties.GetValueOrDefault("line.style") ?? properties.GetValueOrDefault("linestyle");
+        string? lineWidth = properties.GetValueOrDefault("line.width") ?? properties.GetValueOrDefault("linewidth");
+        string? altText   = properties.GetValueOrDefault("alt") ?? properties.GetValueOrDefault("name") ?? "Text Box";
+        string? initialText = properties.GetValueOrDefault("text");
+
+        var siblingShapes = host.Elements<Paragraph>()
+            .SelectMany(p => p.Descendants<Drawing>())
+            .Count();
+        uint docPropId = NextDocPropId();
+        // Build the textbox via InnerXml. wps:wsp ships in OOXML 2010+; the
+        // namespace declarations are the canonical Word ones.
+        string fillXml = !string.IsNullOrEmpty(fillColor)
+            ? $"<a:solidFill><a:srgbClr val=\"{SanitizeHex(fillColor)}\"/></a:solidFill>"
+            : "<a:noFill/>";
+        string lnXml = BuildLineXml(lineStyle, lineWidth, lineColor);
+        string txbxBodyXml = !string.IsNullOrEmpty(initialText)
+            ? $"<w:p xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:r><w:t xml:space=\"preserve\">{System.Security.SecurityElement.Escape(initialText)}</w:t></w:r></w:p>"
+            : "<w:p xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"/>";
+
+        string wrapInnerXml = WrapXmlFragment(wrap);
+
+        // Drawing scaffolding. EffectExtent + DocProperties + a:graphic with
+        // a:graphicData uri = wordprocessingShape; inner wps:wsp carries
+        // spPr (preset rect geometry + fill + line) + txbx (body paragraphs) + bodyPr.
+        string drawingXml = $@"<w:drawing xmlns:w=""http://schemas.openxmlformats.org/wordprocessingml/2006/main"" xmlns:wp=""http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"" xmlns:a=""http://schemas.openxmlformats.org/drawingml/2006/main"" xmlns:wps=""http://schemas.microsoft.com/office/word/2010/wordprocessingShape""><wp:anchor distT=""0"" distB=""0"" distL=""114300"" distR=""114300"" simplePos=""0"" relativeHeight=""251{siblingShapes:D3}"" behindDoc=""0"" locked=""0"" layoutInCell=""1"" allowOverlap=""1""><wp:simplePos x=""0"" y=""0""/><wp:positionH relativeFrom=""column""><wp:posOffset>{hPos}</wp:posOffset></wp:positionH><wp:positionV relativeFrom=""paragraph""><wp:posOffset>{vPos}</wp:posOffset></wp:positionV><wp:extent cx=""{cxEmu}"" cy=""{cyEmu}""/><wp:effectExtent l=""0"" t=""0"" r=""0"" b=""0""/>{wrapInnerXml}<wp:docPr id=""{docPropId}"" name=""{System.Security.SecurityElement.Escape(altText)}""/><wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri=""http://schemas.microsoft.com/office/word/2010/wordprocessingShape""><wps:wsp><wps:cNvSpPr txBox=""1""/><wps:spPr><a:xfrm><a:off x=""0"" y=""0""/><a:ext cx=""{cxEmu}"" cy=""{cyEmu}""/></a:xfrm><a:prstGeom prst=""rect""><a:avLst/></a:prstGeom>{fillXml}{lnXml}</wps:spPr><wps:txbx><w:txbxContent>{txbxBodyXml}</w:txbxContent></wps:txbx><wps:bodyPr rot=""0"" wrap=""square"" lIns=""91440"" tIns=""45720"" rIns=""91440"" bIns=""45720"" anchor=""t"" anchorCtr=""0""/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>";
+
+        var drawing = ParseDrawingFromXml(drawingXml);
+        var run = new Run(drawing);
+        var newPara = new Paragraph(run);
+        AssignParaId(newPara);
+        InsertAtIndexOrAppend(host, newPara, index);
+
+        // Compute the 1-based textbox index across the host. Walk all
+        // paragraphs in the host and count those that carry at least one
+        // wp:anchor with wsp content — same selector as Get.
+        int txbxIdx = CountTextboxesInHost(host, newPara);
+        return $"{hostRoot}/textbox[{txbxIdx}]";
+    }
+
+    private string AddShape(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
+    {
+        var (host, hostRoot) = ResolveDrawingHost(parent, parentPath);
+        string preset = properties.GetValueOrDefault("geometry")
+                     ?? properties.GetValueOrDefault("preset")
+                     ?? "rect";
+        long cxEmu = ParseDrawingSize(properties.GetValueOrDefault("width"), defaultEmu: 914_400);
+        long cyEmu = ParseDrawingSize(properties.GetValueOrDefault("height"), defaultEmu: 914_400);
+        string wrap = properties.GetValueOrDefault("wrap", "none").ToLowerInvariant();
+        long hPos = ParseDrawingPos(properties, "anchor.x", "hposition", defaultEmu: 0);
+        long vPos = ParseDrawingPos(properties, "anchor.y", "vposition", defaultEmu: 0);
+        // fill: bare color, or "none"; "line=STYLE;SIZE;COLOR" composite.
+        string? fillRaw = properties.GetValueOrDefault("fill");
+        string fillXml;
+        if (string.IsNullOrEmpty(fillRaw) || string.Equals(fillRaw, "none", StringComparison.OrdinalIgnoreCase))
+            fillXml = "<a:noFill/>";
+        else
+            fillXml = $"<a:solidFill><a:srgbClr val=\"{SanitizeHex(fillRaw)}\"/></a:solidFill>";
+        // line: either "line=STYLE;SIZE;COLOR" or split keys.
+        string? lineCompact = properties.GetValueOrDefault("line");
+        string? lineStyle = null, lineWidth = null, lineColor = null;
+        if (!string.IsNullOrEmpty(lineCompact)
+            && !string.Equals(lineCompact, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            var parts = lineCompact.Split(';');
+            if (parts.Length >= 1 && !string.IsNullOrEmpty(parts[0])) lineStyle = parts[0];
+            if (parts.Length >= 2 && !string.IsNullOrEmpty(parts[1])) lineWidth = parts[1];
+            if (parts.Length >= 3 && !string.IsNullOrEmpty(parts[2])) lineColor = parts[2];
+        }
+        lineStyle ??= properties.GetValueOrDefault("line.style") ?? properties.GetValueOrDefault("linestyle");
+        lineWidth ??= properties.GetValueOrDefault("line.width") ?? properties.GetValueOrDefault("linewidth");
+        lineColor ??= properties.GetValueOrDefault("line.color") ?? properties.GetValueOrDefault("linecolor");
+        string lnXml = BuildLineXml(lineStyle, lineWidth, lineColor);
+        string altText = properties.GetValueOrDefault("alt") ?? properties.GetValueOrDefault("name") ?? "Shape";
+
+        var siblingShapes = host.Elements<Paragraph>()
+            .SelectMany(p => p.Descendants<Drawing>())
+            .Count();
+        uint docPropId = NextDocPropId();
+        string wrapInnerXml = WrapXmlFragment(wrap);
+
+        string drawingXml = $@"<w:drawing xmlns:w=""http://schemas.openxmlformats.org/wordprocessingml/2006/main"" xmlns:wp=""http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"" xmlns:a=""http://schemas.openxmlformats.org/drawingml/2006/main"" xmlns:wps=""http://schemas.microsoft.com/office/word/2010/wordprocessingShape""><wp:anchor distT=""0"" distB=""0"" distL=""114300"" distR=""114300"" simplePos=""0"" relativeHeight=""251{siblingShapes:D3}"" behindDoc=""0"" locked=""0"" layoutInCell=""1"" allowOverlap=""1""><wp:simplePos x=""0"" y=""0""/><wp:positionH relativeFrom=""column""><wp:posOffset>{hPos}</wp:posOffset></wp:positionH><wp:positionV relativeFrom=""paragraph""><wp:posOffset>{vPos}</wp:posOffset></wp:positionV><wp:extent cx=""{cxEmu}"" cy=""{cyEmu}""/><wp:effectExtent l=""0"" t=""0"" r=""0"" b=""0""/>{wrapInnerXml}<wp:docPr id=""{docPropId}"" name=""{System.Security.SecurityElement.Escape(altText)}""/><wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri=""http://schemas.microsoft.com/office/word/2010/wordprocessingShape""><wps:wsp><wps:cNvSpPr/><wps:spPr><a:xfrm><a:off x=""0"" y=""0""/><a:ext cx=""{cxEmu}"" cy=""{cyEmu}""/></a:xfrm><a:prstGeom prst=""{SanitizeGeometry(preset)}""><a:avLst/></a:prstGeom>{fillXml}{lnXml}</wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>";
+
+        var drawing = ParseDrawingFromXml(drawingXml);
+        var run = new Run(drawing);
+        var newPara = new Paragraph(run);
+        AssignParaId(newPara);
+        InsertAtIndexOrAppend(host, newPara, index);
+
+        int shapeIdx = CountShapesInHost(host, newPara);
+        return $"{hostRoot}/shape[{shapeIdx}]";
+    }
+
+    // ----- helpers shared by AddTextbox / AddShape -----------------------
+
+    private static (OpenXmlElement host, string hostRoot) ResolveDrawingHost(OpenXmlElement parent, string parentPath)
+    {
+        // Accept body / cell / header / footer roots. Path's first segment
+        // ("/body", "/header[N]", "/footer[N]", or "/body/.../tc[N]") is what
+        // we re-use for the returned /<root>/textbox[N] path.
+        if (parent is Body) return (parent, parentPath.TrimEnd('/'));
+        if (parent is TableCell) return (parent, parentPath);
+        // OpenXmlPartRootElement (Header/Footer): use itself.
+        if (parent is Header || parent is Footer) return (parent, parentPath);
+        throw new ArgumentException($"Cannot add textbox/shape under {parentPath}: only /body, /body/tbl/tr/tc[N], /header[N], /footer[N] are supported.");
+    }
+
+    private static long ParseDrawingSize(string? raw, long defaultEmu)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return defaultEmu;
+        try { return ParseEmu(raw); }
+        catch { return defaultEmu; }
+    }
+
+    private static long ParseDrawingPos(Dictionary<string,string> props, string camelKey, string altKey, long defaultEmu)
+    {
+        if (props.TryGetValue(camelKey, out var v) && !string.IsNullOrWhiteSpace(v))
+        { try { return ParseEmu(v); } catch { } }
+        if (props.TryGetValue(altKey, out var v2) && !string.IsNullOrWhiteSpace(v2))
+        { try { return ParseEmu(v2); } catch { } }
+        return defaultEmu;
+    }
+
+    /// <summary>v5.7-cont: convert wrap token to its wp:wrap* fragment.</summary>
+    private static string WrapXmlFragment(string wrap) => wrap.ToLowerInvariant() switch
+    {
+        "square"      => "<wp:wrapSquare wrapText=\"bothSides\"/>",
+        "tight"       => "<wp:wrapTight wrapText=\"bothSides\"><wp:wrapPolygon edited=\"0\"><wp:start x=\"0\" y=\"0\"/><wp:lineTo x=\"21600\" y=\"0\"/><wp:lineTo x=\"21600\" y=\"21600\"/><wp:lineTo x=\"0\" y=\"21600\"/><wp:lineTo x=\"0\" y=\"0\"/></wp:wrapPolygon></wp:wrapTight>",
+        "topbottom" or "topandbottom" => "<wp:wrapTopAndBottom/>",
+        "behind"      => "<wp:wrapNone/>",
+        "infront"     => "<wp:wrapNone/>",
+        "none" or ""  => "<wp:wrapNone/>",
+        _             => "<wp:wrapSquare wrapText=\"bothSides\"/>",
+    };
+
+    /// <summary>Build the <c>a:ln</c> child for spPr. Returns the empty
+    /// string when none of style/width/color was specified — Word then
+    /// uses the theme default.</summary>
+    private static string BuildLineXml(string? style, string? width, string? color)
+    {
+        if (string.IsNullOrEmpty(style) && string.IsNullOrEmpty(width) && string.IsNullOrEmpty(color))
+            return "";
+        // a:ln@w is in EMU (1pt = 12700 EMU). Accept bare integer pt or "Npt"/"Ncm".
+        long lnWidthEmu = 0;
+        if (!string.IsNullOrEmpty(width))
+        {
+            try { lnWidthEmu = ParseEmu(width); } catch { lnWidthEmu = 0; }
+            if (lnWidthEmu == 0 && double.TryParse(width, out var pts)) lnWidthEmu = (long)Math.Round(pts * 12700);
+        }
+        string widthAttr = lnWidthEmu > 0 ? $" w=\"{lnWidthEmu}\"" : "";
+        // Style: "none" emits a:noFill, anything else emits a:solidFill +
+        // optional a:prstDash for non-solid line types.
+        bool isNone = string.Equals(style, "none", StringComparison.OrdinalIgnoreCase);
+        if (isNone) return $"<a:ln{widthAttr}><a:noFill/></a:ln>";
+        string fill = !string.IsNullOrEmpty(color)
+            ? $"<a:solidFill><a:srgbClr val=\"{SanitizeHex(color)}\"/></a:solidFill>"
+            : "<a:solidFill><a:srgbClr val=\"000000\"/></a:solidFill>";
+        string dash = "";
+        if (!string.IsNullOrEmpty(style)
+            && !string.Equals(style, "solid", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(style, "single", StringComparison.OrdinalIgnoreCase))
+        {
+            dash = $"<a:prstDash val=\"{MapDashStyle(style)}\"/>";
+        }
+        return $"<a:ln{widthAttr}>{fill}{dash}</a:ln>";
+    }
+
+    private static string MapDashStyle(string style) => style.ToLowerInvariant() switch
+    {
+        "dot" or "dotted"             => "dot",
+        "dash" or "dashed"            => "dash",
+        "dashdot" or "dotdash"        => "dashDot",
+        "lgdash" or "longdash"        => "lgDash",
+        "sysdash"                     => "sysDash",
+        "sysdot"                      => "sysDot",
+        _                             => "solid",
+    };
+
+    /// <summary>Whitelist of common preset geometry names. Anything else
+    /// falls back to rect rather than emitting schema-invalid XML.</summary>
+    private static string SanitizeGeometry(string preset) => preset.ToLowerInvariant() switch
+    {
+        "rect" or "rectangle"   => "rect",
+        "ellipse" or "circle"    => "ellipse",
+        "line" or "straightline" => "line",
+        "roundrect"              => "roundRect",
+        "triangle"               => "triangle",
+        "diamond"                => "diamond",
+        "pentagon"               => "pentagon",
+        "hexagon"                => "hexagon",
+        "octagon"                => "octagon",
+        "rightarrow"             => "rightArrow",
+        "leftarrow"              => "leftArrow",
+        "uparrow"                => "upArrow",
+        "downarrow"              => "downArrow",
+        "star5"                  => "star5",
+        "wedgerectcallout"       => "wedgeRectCallout",
+        _                        => "rect",
+    };
+
+    /// <summary>Parse a w:drawing element from XML with full namespace
+    /// declarations and return the typed <see cref="Drawing"/>. The naive
+    /// <c>new Drawing { InnerXml = ... }</c> path drops the outer
+    /// namespace context the inner elements need (wp:, a:, wps: prefixes
+    /// land as undeclared), so we route through an XmlReader to keep the
+    /// nsmgr alive for the parse.</summary>
+    private static Drawing ParseDrawingFromXml(string xml)
+    {
+        // Wrap inside w:p > w:r > drawing so the outer namespace context
+        // (declared on the root) is visible to inner wp:/a:/wps: prefixes.
+        // <w:drawing> belongs inside <w:r>, so the Run wrapper is the
+        // minimal schema-legal host.
+        var wrapXml = $@"<w:p xmlns:w=""http://schemas.openxmlformats.org/wordprocessingml/2006/main""><w:r>{xml}</w:r></w:p>";
+        var p = new Paragraph(wrapXml);
+        var d = p.Descendants<Drawing>().FirstOrDefault();
+        if (d == null)
+            throw new InvalidOperationException("Drawing parse failed");
+        d.Remove();
+        return d;
+    }
+
+    private static int CountTextboxesInHost(OpenXmlElement host, Paragraph anchor)
+    {
+        int count = 0;
+        foreach (var p in host.Elements<Paragraph>())
+        {
+            // A textbox is recognized by a wp:anchor containing a wps:wsp
+            // that has a txBox=1 cNvSpPr OR a wps:txbx child.
+            bool isTextbox = p.Descendants<Drawing>().Any(d =>
+                d.InnerXml.Contains("txBox=\"1\"")
+                || d.InnerXml.Contains("<wps:txbx"));
+            if (isTextbox) count++;
+            if (ReferenceEquals(p, anchor)) return count;
+        }
+        return count;
+    }
+
+    private static int CountShapesInHost(OpenXmlElement host, Paragraph anchor)
+    {
+        // Stay in lockstep with the Navigation "shape" resolver, which
+        // excludes textbox-bearing Drawings (a textbox is a <wps:wsp>
+        // wrapping a <wps:txbx>, so the unfiltered `<wps:wsp` test counts
+        // textboxes as shapes and the Add-side index drifts ahead of the
+        // Get-side index by one per textbox.
+        int count = 0;
+        foreach (var p in host.Elements<Paragraph>())
+        {
+            bool isShape = p.Descendants<Drawing>().Any(d =>
+            {
+                var xml = d.InnerXml;
+                if (!xml.Contains("<wps:wsp")) return false;
+                if (xml.Contains("<wps:txbx") || xml.Contains("txBox=\"1\"")) return false;
+                return true;
+            });
+            if (isShape) count++;
+            if (ReferenceEquals(p, anchor)) return count;
+        }
+        return count;
+    }
+}
