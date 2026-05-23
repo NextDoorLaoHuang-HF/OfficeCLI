@@ -2415,6 +2415,8 @@ public partial class WordHandler
             if (!string.IsNullOrEmpty(tblTcAuthor)) tblPrChange.Author = tblTcAuthor;
             if (!string.IsNullOrEmpty(tblTcDate) && DateTime.TryParse(tblTcDate, out var tblTcDt))
                 tblPrChange.Date = tblTcDt;
+            else
+                tblPrChange.Date = DateTime.UtcNow;
             tblPrChange.Id = !string.IsNullOrEmpty(tblTcId)
                 ? tblTcId : GetNextRevisionId().ToString();
             tblPrChange.AppendChild(new PreviousTableProperties());

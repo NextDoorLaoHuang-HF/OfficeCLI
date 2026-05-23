@@ -1031,6 +1031,8 @@ public partial class WordHandler
             if (!string.IsNullOrEmpty(secTcAuthor)) sectPrChange.Author = secTcAuthor;
             if (!string.IsNullOrEmpty(secTcDate) && DateTime.TryParse(secTcDate, out var secTcDt))
                 sectPrChange.Date = secTcDt;
+            else
+                sectPrChange.Date = DateTime.UtcNow;
             sectPrChange.Id = !string.IsNullOrEmpty(secTcId)
                 ? secTcId : GetNextRevisionId().ToString();
             sectPrChange.AppendChild(new PreviousSectionProperties());

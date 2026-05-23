@@ -677,8 +677,11 @@ public partial class WordHandler
             {
                 var marker = new Inserted();
                 if (!string.IsNullOrEmpty(trTcAuthor)) marker.Author = trTcAuthor;
+                else marker.Author = "";
                 if (!string.IsNullOrEmpty(trTcDate) && DateTime.TryParse(trTcDate, out var trDate))
                     marker.Date = trDate;
+                else
+                    marker.Date = DateTime.UtcNow;
                 marker.Id = !string.IsNullOrEmpty(trTcId) ? trTcId : GetNextRevisionId().ToString();
                 newRowProps.AppendChild(marker);
             }
@@ -686,8 +689,11 @@ public partial class WordHandler
             {
                 var marker = new Deleted();
                 if (!string.IsNullOrEmpty(trTcAuthor)) marker.Author = trTcAuthor;
+                else marker.Author = "";
                 if (!string.IsNullOrEmpty(trTcDate) && DateTime.TryParse(trTcDate, out var trDate))
                     marker.Date = trDate;
+                else
+                    marker.Date = DateTime.UtcNow;
                 marker.Id = !string.IsNullOrEmpty(trTcId) ? trTcId : GetNextRevisionId().ToString();
                 newRowProps.AppendChild(marker);
             }
@@ -695,8 +701,9 @@ public partial class WordHandler
             // Word requires cell-paragraph runs to also be wrapped in ins/del
             // for the row-level revision to render correctly. Without this,
             // Word shows no revision mark for the row content.
+            // A date attribute is required — default to now if omitted.
             var author = trTcAuthor ?? "";
-            DateTime? revDate = null;
+            var revDate = DateTime.UtcNow;
             if (trTcDate != null && DateTime.TryParse(trTcDate, out var parsedDate))
                 revDate = parsedDate;
 
@@ -711,7 +718,7 @@ public partial class WordHandler
                     {
                         var wrapper = new InsertedRun();
                         wrapper.Author = author;
-                        if (revDate.HasValue) wrapper.Date = revDate.Value;
+                        wrapper.Date = revDate;
                         wrapper.Id = GetNextRevisionId().ToString();
                         // Insert wrapper before first run
                         para.InsertBefore(wrapper, runs[0]);
@@ -725,7 +732,7 @@ public partial class WordHandler
                     {
                         var wrapper = new DeletedRun();
                         wrapper.Author = author;
-                        if (revDate.HasValue) wrapper.Date = revDate.Value;
+                        wrapper.Date = revDate;
                         wrapper.Id = GetNextRevisionId().ToString();
                         // Convert w:t → w:delText inside wrapper
                         para.InsertBefore(wrapper, runs[0]);
