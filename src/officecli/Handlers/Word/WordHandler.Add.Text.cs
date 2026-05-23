@@ -1112,6 +1112,8 @@ public partial class WordHandler
             if (!string.IsNullOrEmpty(pTcAuthor)) pprChange.Author = pTcAuthor;
             if (!string.IsNullOrEmpty(pTcDate) && DateTime.TryParse(pTcDate, out var pTcDt))
                 pprChange.Date = pTcDt;
+            else
+                pprChange.Date = DateTime.UtcNow;
             pprChange.Id = !string.IsNullOrEmpty(pTcId)
                 ? pTcId
                 : GetNextRevisionId().ToString();
@@ -1860,6 +1862,8 @@ public partial class WordHandler
             if (!string.IsNullOrEmpty(trackChangeDate)
                 && DateTime.TryParse(trackChangeDate, out var tcfDate))
                 rprChange.Date = tcfDate;
+            else
+                rprChange.Date = DateTime.UtcNow;
             rprChange.Id = !string.IsNullOrEmpty(trackChangeId)
                 ? trackChangeId
                 : GetNextRevisionId().ToString();
@@ -1887,6 +1891,11 @@ public partial class WordHandler
                 {
                     if (wrapper is InsertedRun insW2) insW2.Date = tcDate;
                     else if (wrapper is DeletedRun delW2) delW2.Date = tcDate;
+                }
+                else
+                {
+                    if (wrapper is InsertedRun insW2b) insW2b.Date = DateTime.UtcNow;
+                    else if (wrapper is DeletedRun delW2b) delW2b.Date = DateTime.UtcNow;
                 }
                 if (!string.IsNullOrEmpty(trackChangeId))
                 {
@@ -1931,6 +1940,8 @@ public partial class WordHandler
                 if (!string.IsNullOrEmpty(trackChangeDate)
                     && DateTime.TryParse(trackChangeDate, out var mfDate))
                     wrapper.Date = mfDate;
+                else
+                    wrapper.Date = DateTime.UtcNow;
                 wrapper.Id = !string.IsNullOrEmpty(trackChangeId)
                     ? trackChangeId : GetNextRevisionId().ToString();
                 // MoveFrom uses w:delText (same conversion as w:del)
@@ -1954,6 +1965,8 @@ public partial class WordHandler
                 if (!string.IsNullOrEmpty(trackChangeDate)
                     && DateTime.TryParse(trackChangeDate, out var mtDate))
                     wrapper.Date = mtDate;
+                else
+                    wrapper.Date = DateTime.UtcNow;
                 wrapper.Id = !string.IsNullOrEmpty(trackChangeId)
                     ? trackChangeId : GetNextRevisionId().ToString();
                 // MoveTo uses w:t (same as w:ins) — no text conversion needed
