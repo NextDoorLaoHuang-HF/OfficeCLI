@@ -466,7 +466,52 @@ officecli add "$FILE" "/body/p[3]" --type footnote --prop text="See Appendix A f
 
 **docx vs word-form skill — when to switch.** Stay in docx for any report, letter, memo, or proposal. Switch to `officecli-word-form` when the document's purpose is **data capture** — fillable intake forms, contracts / SOWs with user-fill slots, HR onboarding forms, medical questionnaires, compliance checklists, mail-merge templates. Those carry `<w:sdt>` content controls, `<w:ffData>` legacy form fields, or `documentProtection=forms`, none of which this skill teaches.
 
-**Comments and tracked changes.** Bulk accept/reject: `set / --prop accept-changes=all` (or `reject-changes=all`). Locate individual changes with `query ins` and `query del` — NOT `query trackedchange` (CLI bug C-D-1). Adding an `<w:ins>` or `<w:del>` from scratch requires `raw-set`. Add a comment with `add "/body/p[4]" --type comment --prop author=... --prop text=...`. Reply threading (`parentId`) and `done=true` resolution are UNSUPPORTED — see C-D-2 / C-D-5 for `raw-set` workarounds.
+**Comments and tracked changes.** Bulk accept/reject: `set / --prop acceptallchanges=all` (or `rejectallchanges=all`). Query all revisions: `query revision`.
+
+**Creating revisions (Track Changes mode).** Use `--prop trackChange=...` on `add` and `set` to create tracked insertions, deletions, format changes, and moves. No raw-set needed.
+
+```bash
+# Insert revision (green underline in preview)
+officecli add "$FILE" '/body/p[1]' --type run --prop trackChange=ins --prop trackChange.author=AI --prop text="new clause"
+
+# Delete revision (red strikethrough in preview)
+officecli add "$FILE" '/body/p[1]' --type run --prop trackChange=del --prop trackChange.author=AI --prop text="removed text"
+
+# Format change revision (yellow highlight in preview)
+officecli add "$FILE" '/body/p[1]' --type run --prop trackChange=format --prop trackChange.author=AI --prop bold=true --prop text="formatted"
+
+# Move revision (double green underline/strikethrough)
+officecli add "$FILE" '/body/p[1]' --type run --prop trackChange=moveFrom --prop trackChange.author=AI --prop text="moved text"
+officecli add "$FILE" '/body/p[2]' --type run --prop trackChange=moveTo --prop trackChange.author=AI --prop text="moved text"
+
+# Paragraph-level format revision
+officecli add "$FILE" /body --type paragraph --prop trackChange=format --prop trackChange.author=AI --prop text="reformatted paragraph"
+
+# Toggle Track Changes mode (new edits auto-tracked in Word)
+officecli set "$FILE" / --prop trackRevisions=true
+```
+
+**Revision workflow.** Typical pattern: enable tracking → make changes → query → accept/reject.
+
+```bash
+# 1. See what revisions exist
+officecli query "$FILE" revision
+
+# 2. Accept or reject all
+officecli set "$FILE" / --prop acceptallchanges=all
+officecli set "$FILE" / --prop rejectallchanges=all
+```
+
+**trackChange properties:**
+
+| Property | Values | Scope |
+|----------|--------|-------|
+| `trackChange` | `ins`, `del`, `format`, `moveFrom`, `moveTo` | add run/paragraph |
+| `trackChange.author` | Any string | add run/paragraph |
+| `trackChange.date` | ISO 8601 (default: now) | add run/paragraph |
+| `trackChange.id` | Integer (default: auto) | add run/paragraph |
+
+Add a comment with `add "/body/p[4]" --type comment --prop author=... --prop text=...`. Reply threading (`parentId`) and `done=true` resolution are UNSUPPORTED — see C-D-2 / C-D-5 for `raw-set` workarounds.
 
 **Watermark.** Two steps because `add --prop opacity=...` is UNSUPPORTED (C-D-7): `add / --type watermark --prop text="DRAFT" --prop color=BFBFBF`, then `set /watermark --prop opacity=0.8`. Default opacity is 0.5.
 
@@ -476,7 +521,7 @@ Three tiers of precision; use the lowest that does the job.
 
 - **L1 — high-level props** (`--prop text=...`, `--prop style=Heading1`): your default. Works for 80% of cases.
 - **L2 — dotted-attr fallback** (`pbdr.top=`, `ind.left=`, `padding.top=`, `border.*`, `font.size=`, `font.color=`): when L1 lacks the exact knob. Schema-safe for most props. Example: `--prop pbdr.bottom="single;6;1F4E79;0"`. Prefer this over raw-set when the whitelist covers your need. **Two dotted props emit invalid XML today** — `shd.fill=` (missing `w:val`) and `ind.firstLine=` (placed after `w:jc` in `pPr`). Use the canonical L1 form of these instead: `shd=clear;FFFF00` and `firstLineIndent=360`. See Known Issues → Schema-invalid-on-emit.
-- **L3 — `raw-set` with XML**: last resort. Tied to OOXML knowledge; no schema protection. Use for tracked-change creation, internal hyperlinks, composite PAGE+NUMPAGES, comment `parentId`, `commentsExtended` `done=1`.
+- **L3 — `raw-set` with XML**: last resort. Tied to OOXML knowledge; no schema protection. Use for internal hyperlinks, composite PAGE+NUMPAGES, comment `parentId`, `commentsExtended` `done=1`.
 
 Borders go through the format `style;size;color;space`: `single;4;FF0000;1`. Hex colors never start with `#`: `FF0000`, not `#FF0000`. Scheme color names (`accent1..6`, `dark1`/`dark2`, `light1`/`light2`, `hyperlink`) are also accepted anywhere a hex color is (1.0.60+) — prefer hex when you need stable colors across themes.
 
