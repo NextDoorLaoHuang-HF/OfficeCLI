@@ -3737,28 +3737,37 @@ public partial class WordHandler
     /// all revision elements (w:ins, w:del, w:moveFrom, w:moveTo, rPrChange,
     /// pPrChange, sectPrChange, tblPrChange, and table-row markers).
     /// </summary>
+    // Lazy-initialised cache: first call scans the document, subsequent
+    // calls simply increment.  Ensures IDs are unique even when multiple
+    // revision elements are created in the same method invocation.
+    private int _cachedMaxRevisionId = -1;
+
     private int GetNextRevisionId()
     {
-        int maxId = 0;
-        var body = _doc.MainDocumentPart?.Document?.Body;
-        if (body != null)
+        if (_cachedMaxRevisionId < 0)
         {
-            foreach (var elem in body.Descendants())
+            int maxId = 0;
+            var body = _doc.MainDocumentPart?.Document?.Body;
+            if (body != null)
             {
-                if (elem is InsertedRun or DeletedRun or MoveFromRun or MoveToRun
-                    or RunPropertiesChange or ParagraphPropertiesChange
-                    or SectionPropertiesChange or TablePropertiesChange
-                    or Inserted or Deleted
-                    or MoveFrom or MoveTo)
+                foreach (var elem in body.Descendants())
                 {
-                    var idAttr = elem.GetAttributes()
-                        .FirstOrDefault(a => a.LocalName == "id");
-                    if (idAttr.Value != null && int.TryParse(idAttr.Value, out int id) && id > maxId)
-                        maxId = id;
+                    if (elem is InsertedRun or DeletedRun or MoveFromRun or MoveToRun
+                        or RunPropertiesChange or ParagraphPropertiesChange
+                        or SectionPropertiesChange or TablePropertiesChange
+                        or Inserted or Deleted
+                        or MoveFrom or MoveTo)
+                    {
+                        var idAttr = elem.GetAttributes()
+                            .FirstOrDefault(a => a.LocalName == "id");
+                        if (idAttr.Value != null && int.TryParse(idAttr.Value, out int id) && id > maxId)
+                            maxId = id;
+                    }
                 }
             }
+            _cachedMaxRevisionId = maxId;
         }
-        return maxId + 1;
+        return ++_cachedMaxRevisionId;
     }
 
     // ==================== SDT IDs (content controls) ====================
