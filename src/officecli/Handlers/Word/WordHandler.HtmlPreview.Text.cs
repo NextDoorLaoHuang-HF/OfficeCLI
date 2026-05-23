@@ -46,7 +46,22 @@ public partial class WordHandler
             classes.Add("has-ptab");
         if (classes.Count > 0)
             sb.Append($" class=\"{string.Join(" ", classes)}\"");
+
+        // Tracked paragraph format change (pPrChange) — yellow left border with author attribution
+        var pPrChange = para.ParagraphProperties?.GetFirstChild<ParagraphPropertiesChange>();
+        if (pPrChange != null)
+        {
+            var pAuthor = pPrChange.Author?.Value ?? "";
+            if (!string.IsNullOrEmpty(pAuthor))
+                sb.Append($" title=\"Format changed by {HtmlEncodeAttr(pAuthor)}\"");
+        }
+
         var pStyle = GetParagraphInlineCss(para);
+        if (pPrChange != null)
+        {
+            var fmtStyle = "background:#FFF9C4;border-left:4px solid #FFC107";
+            pStyle = string.IsNullOrEmpty(pStyle) ? fmtStyle : pStyle + ";" + fmtStyle;
+        }
         if (!string.IsNullOrEmpty(pStyle))
             sb.Append($" style=\"{pStyle}\"");
         sb.Append(">");
@@ -106,7 +121,7 @@ public partial class WordHandler
 
                 RenderRunHtml(sb, run, para);
             }
-            else if (child.LocalName is "ins" or "moveTo")
+            else if (child.LocalName is "ins")
             {
                 // Tracked insertions — underline to match Word's default revision mark style
                 var author = child.GetAttributes().FirstOrDefault(a => a.LocalName == "author").Value;
@@ -128,7 +143,17 @@ public partial class WordHandler
                     sb.Append($"<span class=\"track-del\" style=\"text-decoration:line-through;color:#C62828\">{HtmlEncode(nestedDelText)}</span>");
                 sb.Append("</span>");
             }
-            else if (child.LocalName is "del" or "moveFrom")
+            else if (child.LocalName is "moveTo")
+            {
+                // Tracked move target — double underline in green to distinguish from insertion
+                var author = child.GetAttributes().FirstOrDefault(a => a.LocalName == "author").Value;
+                var authorAttr = string.IsNullOrEmpty(author) ? "" : $" title=\"Moved to by {HtmlEncodeAttr(author)}\"";
+                sb.Append($"<span class=\"track-move\" style=\"text-decoration:underline double;color:#2E7D32\"{authorAttr}>");
+                foreach (var moveToRun in child.Descendants<Run>())
+                    RenderRunHtml(sb, moveToRun, para);
+                sb.Append("</span>");
+            }
+            else if (child.LocalName is "del")
             {
                 // Tracked deletions — strikethrough with color, preserving the deleted text
                 // The delText inside del runs carries the actual deleted content; we render it so
@@ -140,6 +165,17 @@ public partial class WordHandler
                     .Select(e => e.InnerText));
                 if (!string.IsNullOrEmpty(delText))
                     sb.Append($"<span class=\"track-del\" style=\"text-decoration:line-through;color:#C62828\"{authorAttr}>{HtmlEncode(delText)}</span>");
+            }
+            else if (child.LocalName is "moveFrom")
+            {
+                // Tracked move source — double strikethrough in green to distinguish from deletion
+                var author = child.GetAttributes().FirstOrDefault(a => a.LocalName == "author").Value;
+                var authorAttr = string.IsNullOrEmpty(author) ? "" : $" title=\"Moved from by {HtmlEncodeAttr(author)}\"";
+                var moveFromText = string.Concat(child.Descendants()
+                    .Where(e => e.LocalName == "delText" || e.LocalName == "t")
+                    .Select(e => e.InnerText));
+                if (!string.IsNullOrEmpty(moveFromText))
+                    sb.Append($"<span class=\"track-movefrom\" style=\"text-decoration:line-through double;color:#2E7D32\"{authorAttr}>{HtmlEncode(moveFromText)}</span>");
             }
             else if (child is Hyperlink hyperlink)
             {
@@ -303,6 +339,17 @@ public partial class WordHandler
             return;
         if (rProps.SpecVanish != null && (rProps.SpecVanish.Val == null || rProps.SpecVanish.Val.Value))
             return;
+
+        // Tracked format change (rPrChange) — yellow highlight with author attribution
+        var rPrChange = run.RunProperties?.GetFirstChild<RunPropertiesChange>();
+        bool hasRPrChange = rPrChange != null;
+        if (hasRPrChange)
+        {
+            var author = rPrChange!.Author?.Value ?? "";
+            var authorAttr = string.IsNullOrEmpty(author) ? "" : $" title=\"Format changed by {HtmlEncodeAttr(author)}\"";
+            sb.Append($"<span class=\"track-format\" style=\"background:#FFF9C4;border-bottom:2px solid #FFC107\"{authorAttr}>");
+        }
+
         var style = GetRunInlineCss(rProps, para);
         var needsSpan = !string.IsNullOrEmpty(style);
 
@@ -469,6 +516,8 @@ public partial class WordHandler
         }
 
         if (needsSpan && !_ctx.LineBreakEnabled)
+            sb.Append("</span>");
+        if (hasRPrChange)
             sb.Append("</span>");
     }
 

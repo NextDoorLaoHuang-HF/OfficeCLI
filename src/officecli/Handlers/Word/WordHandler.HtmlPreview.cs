@@ -1969,7 +1969,17 @@ public partial class WordHandler
                     // BuildListMarkerCss so this <li> picks up the abstractNum
                     // level rPr (color/font/size/bold/italic) for ul, plus
                     // a custom list-style-type string when applicable.
-                    sb.Append($" class=\"marker-{numId}-{ilvlOoxml}\"");
+                    var liClasses = $"marker-{numId}-{ilvlOoxml}";
+                    // Tracked paragraph format change (pPrChange) — yellow left border
+                    var listPprChange = para.ParagraphProperties?.GetFirstChild<ParagraphPropertiesChange>();
+                    if (listPprChange != null)
+                    {
+                        liClasses += " track-format";
+                        var listPprAuthor = listPprChange.Author?.Value ?? "";
+                        if (!string.IsNullOrEmpty(listPprAuthor))
+                            sb.Append($" title=\"Format changed by {HtmlEncodeAttr(listPprAuthor)}\"");
+                    }
+                    sb.Append($" class=\"{liClasses}\"");
                     var paraStyle = GetParagraphInlineCss(para, isListItem: true);
                     // ul markers render via ::marker pseudo, which sits outside
                     // the line box and can't inflate it. ol markers render via
@@ -2064,6 +2074,16 @@ public partial class WordHandler
                     var pStyleId = para.ParagraphProperties?.ParagraphStyleId?.Val?.Value;
                     if (ResolveStyleBold(pStyleId) != true)
                         hStyle = string.IsNullOrEmpty(hStyle) ? "font-weight:normal" : $"{hStyle};font-weight:normal";
+                    // Tracked paragraph format change (pPrChange) — yellow left border
+                    var headPprChange = para.ParagraphProperties?.GetFirstChild<ParagraphPropertiesChange>();
+                    if (headPprChange != null)
+                    {
+                        var fmtStyle = "background:#FFF9C4;border-left:4px solid #FFC107";
+                        hStyle = string.IsNullOrEmpty(hStyle) ? fmtStyle : hStyle + ";" + fmtStyle;
+                        var headPprAuthor = headPprChange.Author?.Value ?? "";
+                        if (!string.IsNullOrEmpty(headPprAuthor))
+                            sb.Append($" title=\"Format changed by {HtmlEncodeAttr(headPprAuthor)}\"");
+                    }
                     if (!string.IsNullOrEmpty(hStyle))
                         sb.Append($" style=\"{hStyle}\"");
                     sb.Append(">");
@@ -2156,6 +2176,16 @@ public partial class WordHandler
                     if (classNames.Count > 0)
                         sb.Append($" class=\"{string.Join(" ", classNames)}\"");
                     var pStyle = GetParagraphInlineCss(para);
+                    // Tracked paragraph format change (pPrChange) — yellow left border
+                    var bodyPprChange = para.ParagraphProperties?.GetFirstChild<ParagraphPropertiesChange>();
+                    if (bodyPprChange != null)
+                    {
+                        var fmtStyle = "background:#FFF9C4;border-left:4px solid #FFC107";
+                        pStyle = string.IsNullOrEmpty(pStyle) ? fmtStyle : pStyle + ";" + fmtStyle;
+                        var bodyPprAuthor = bodyPprChange.Author?.Value ?? "";
+                        if (!string.IsNullOrEmpty(bodyPprAuthor))
+                            sb.Append($" title=\"Format changed by {HtmlEncodeAttr(bodyPprAuthor)}\"");
+                    }
                     if (!string.IsNullOrEmpty(pStyle))
                         sb.Append($" style=\"{pStyle}\"");
                     sb.Append(">");

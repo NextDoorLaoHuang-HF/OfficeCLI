@@ -3,3 +3,10 @@
 pr-screenshots/
 pr-descriptions/
 screenshots/
+
+# Build output
+**/bin/
+**/obj/
+
+# Temp files
+pr-review-report.md
