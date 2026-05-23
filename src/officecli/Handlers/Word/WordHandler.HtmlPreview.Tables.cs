@@ -147,12 +147,25 @@ public partial class WordHandler
         }
 
         var tableClass = tableBordersNone ? "borderless" : "";
+
+        // Tracked table format change (tblPrChange) — yellow highlight with author attribution
+        var tblPrChange = tblPr?.GetFirstChild<TablePropertiesChange>();
+        var tblFmtAuthorAttr = "";
+        if (tblPrChange != null)
+        {
+            tableClass = string.IsNullOrEmpty(tableClass) ? "track-format" : tableClass + " track-format";
+            tableStyles.Add("background:#FFF9C4;border-left:4px solid #FFC107");
+            var tblAuthor = tblPrChange.Author?.Value ?? "";
+            if (!string.IsNullOrEmpty(tblAuthor))
+                tblFmtAuthorAttr = $" title=\"Format changed by {HtmlEncodeAttr(tblAuthor)}\"";
+        }
+
         var tableStyleAttr = tableStyles.Count > 0 ? $" style=\"{string.Join(";", tableStyles)}\"" : "";
         var dataPathAttr = !string.IsNullOrEmpty(dataPath) ? $" data-path=\"{dataPath}\"" : "";
         if (!string.IsNullOrEmpty(tableClass))
-            sb.AppendLine($"<table class=\"{tableClass}\"{dataPathAttr}{tableStyleAttr}>");
+            sb.AppendLine($"<table class=\"{tableClass}\"{dataPathAttr}{tblFmtAuthorAttr}{tableStyleAttr}>");
         else
-            sb.AppendLine($"<table{dataPathAttr}{tableStyleAttr}>");
+            sb.AppendLine($"<table{dataPathAttr}{tblFmtAuthorAttr}{tableStyleAttr}>");
 
         // Get column widths from grid
         // tblLayout=fixed → use fixed col widths; auto/missing → let browser auto-fit by content
@@ -198,7 +211,51 @@ public partial class WordHandler
             sb.AppendLine("</colgroup>");
         }
 
-        var rows = table.Elements<TableRow>().ToList();
+        var rows = new List<TableRow>();
+        var revisionRowFlags = new Dictionary<TableRow, (string? revisionType, string? author)>();
+        foreach (var child in table.ChildElements)
+        {
+            if (child is TableRow tr)
+            {
+                rows.Add(tr);
+            }
+            else if (child.LocalName is "ins" or "del" or "moveTo" or "moveFrom")
+            {
+                var revType = child.LocalName;
+                var revAuthor = child.GetAttributes().FirstOrDefault(a => a.LocalName == "author").Value;
+                // SDK may parse <w:tr> inside revision wrappers as OpenXmlUnknownElement
+                // rather than strong-typed TableRow. Try Descendants<TableRow> first,
+                // then fall back to manual reconstruction from raw XML.
+                var nestedRows = child.Descendants<TableRow>().ToList();
+                if (nestedRows.Count > 0)
+                {
+                    foreach (var nestedRow in nestedRows)
+                    {
+                        if (!rows.Contains(nestedRow))
+                        {
+                            rows.Add(nestedRow);
+                            revisionRowFlags[nestedRow] = (revType, revAuthor);
+                        }
+                    }
+                }
+                else
+                {
+                    // Fallback: find <w:tr> children parsed as OpenXmlUnknownElement
+                    // and reconstruct them as TableRow via Clone().outerxml
+                    foreach (var maybeRow in child.Elements())
+                    {
+                        if (maybeRow.LocalName == "tr")
+                        {
+                            // Re-parse the outer XML as a TableRow so the rendering
+                            // code (which expects strong-typed properties) works.
+                            var reconstructed = new TableRow(maybeRow.OuterXml);
+                            rows.Add(reconstructed);
+                            revisionRowFlags[reconstructed] = (revType, revAuthor);
+                        }
+                    }
+                }
+            }
+        }
         var totalRows = rows.Count;
         var totalCols = tblGrid?.Elements<GridColumn>().Count() ?? rows.FirstOrDefault()?.Elements<TableCell>().Count() ?? 0;
 
@@ -229,7 +286,32 @@ public partial class WordHandler
             // have a stable /body/table[N] index.
             var rowDataPath = !string.IsNullOrEmpty(dataPath) ? $"{dataPath}/tr[{rowIdx + 1}]" : null;
             var rowDataPathAttr = rowDataPath != null ? $" data-path=\"{rowDataPath}\"" : "";
-            sb.AppendLine(isHeader ? $"<tr class=\"header-row\"{hdrMarker}{rowDataPathAttr}{trStyle}>" : $"<tr{rowDataPathAttr}{trStyle}>");
+            // Tracked row revision (wrapped in ins/del/moveTo/moveFrom) — visual marker
+            var rowRevAttr = "";
+            var rowRevSuffix = "";
+            if (revisionRowFlags.TryGetValue(row, out var revInfo))
+            {
+                var (revType, revAuthor) = revInfo;
+                if (revType == "ins" || revType == "moveTo")
+                {
+                    rowRevAttr = string.IsNullOrEmpty(revAuthor)
+                        ? " title=\"Inserted row\""
+                        : $" title=\"Inserted row by {HtmlEncodeAttr(revAuthor)}\"";
+                    rowRevSuffix = " track-ins-row";
+                }
+                else // del or moveFrom
+                {
+                    rowRevAttr = string.IsNullOrEmpty(revAuthor)
+                        ? " title=\"Deleted row\""
+                        : $" title=\"Deleted row by {HtmlEncodeAttr(revAuthor)}\"";
+                    rowRevSuffix = " track-del-row";
+                }
+            }
+            sb.AppendLine(isHeader
+                ? $"<tr class=\"header-row{rowRevSuffix}\"{hdrMarker}{rowRevAttr}{rowDataPathAttr}{trStyle}>"
+                : string.IsNullOrEmpty(rowRevSuffix)
+                    ? $"<tr{rowRevAttr}{rowDataPathAttr}{trStyle}>"
+                    : $"<tr class=\"{rowRevSuffix.Trim()}\"{rowRevAttr}{rowDataPathAttr}{trStyle}>");
 
             int colIdx = 0;
             foreach (var cell in row.Elements<TableCell>())
@@ -546,9 +628,49 @@ public partial class WordHandler
         return null;
     }
 
+    /// <summary>
+    /// Get all TableRow elements from a table, including those nested inside
+    /// revision wrappers (w:ins, w:del, w:moveTo, w:moveFrom).
+    /// Handles SDK quirk where rows inside revision wrappers may be parsed
+    /// as OpenXmlUnknownElement rather than strong-typed TableRow.
+    /// </summary>
+    private static List<TableRow> GetFlattenedTableRows(Table table)
+    {
+        var rows = new List<TableRow>();
+        foreach (var child in table.ChildElements)
+        {
+            if (child is TableRow tr)
+            {
+                rows.Add(tr);
+            }
+            else if (child.LocalName is "ins" or "del" or "moveTo" or "moveFrom")
+            {
+                var nested = child.Descendants<TableRow>().ToList();
+                if (nested.Count > 0)
+                {
+                    foreach (var r in nested)
+                        if (!rows.Contains(r)) rows.Add(r);
+                }
+                else
+                {
+                    foreach (var maybeRow in child.Elements())
+                    {
+                        if (maybeRow.LocalName == "tr")
+                        {
+                            var reconstructed = new TableRow(maybeRow.OuterXml);
+                            if (!rows.Contains(reconstructed))
+                                rows.Add(reconstructed);
+                        }
+                    }
+                }
+            }
+        }
+        return rows;
+    }
+
     private static int CountRowSpan(Table table, TableRow startRow, TableCell startCell)
     {
-        var rows = table.Elements<TableRow>().ToList();
+        var rows = GetFlattenedTableRows(table);
         var startRowIdx = rows.IndexOf(startRow);
         if (startRowIdx < 0) return 1;
 
