@@ -691,6 +691,64 @@ public partial class WordHandler
                 marker.Id = !string.IsNullOrEmpty(trTcId) ? trTcId : GetNextRevisionId().ToString();
                 newRowProps.AppendChild(marker);
             }
+
+            // Word requires cell-paragraph runs to also be wrapped in ins/del
+            // for the row-level revision to render correctly. Without this,
+            // Word shows no revision mark for the row content.
+            var author = trTcAuthor ?? "";
+            DateTime? revDate = null;
+            if (trTcDate != null && DateTime.TryParse(trTcDate, out var parsedDate))
+                revDate = parsedDate;
+
+            foreach (var tc in newRow.Elements<TableCell>())
+            {
+                foreach (var para in tc.Elements<Paragraph>())
+                {
+                    var runs = para.Elements<Run>().ToList();
+                    if (runs.Count == 0) continue;
+
+                    if (kind == "ins")
+                    {
+                        var wrapper = new InsertedRun();
+                        wrapper.Author = author;
+                        if (revDate.HasValue) wrapper.Date = revDate.Value;
+                        wrapper.Id = GetNextRevisionId().ToString();
+                        // Insert wrapper before first run
+                        para.InsertBefore(wrapper, runs[0]);
+                        foreach (var r in runs)
+                        {
+                            wrapper.AppendChild(r.CloneNode(true));
+                            r.Remove();
+                        }
+                    }
+                    else // del
+                    {
+                        var wrapper = new DeletedRun();
+                        wrapper.Author = author;
+                        if (revDate.HasValue) wrapper.Date = revDate.Value;
+                        wrapper.Id = GetNextRevisionId().ToString();
+                        // Convert w:t → w:delText inside wrapper
+                        para.InsertBefore(wrapper, runs[0]);
+                        foreach (var r in runs)
+                        {
+                            var cloned = (Run)r.CloneNode(true);
+                            var text = cloned.GetFirstChild<Text>();
+                            if (text != null)
+                            {
+                                var delText = new DeletedText { Space = text.Space, Text = text.Text };
+                                text.Remove();
+                                var rPr = cloned.GetFirstChild<RunProperties>();
+                                if (rPr != null)
+                                    cloned.InsertAfter(delText, rPr);
+                                else
+                                    cloned.PrependChild(delText);
+                            }
+                            wrapper.AppendChild(cloned);
+                            r.Remove();
+                        }
+                    }
+                }
+            }
         }
         // Skip trackChange dotted keys from falling into unsupported
         foreach (var key in properties.Keys.ToList())
