@@ -613,6 +613,18 @@ If you find OfficeCLI useful, please [give it a star on GitHub](https://github.c
 
 [OfficeCLI.AI](https://OfficeCLI.AI) | [GitHub](https://github.com/iOfficeAI/OfficeCLI)
 
+## AionUI Track Changes Skill
+
+OfficeCLI v5.10+ supports Track Changes / 修订模式 (`--prop trackChange=ins/del/format`), but the AionUI builtin skill does not include this section yet. A user skill is available as a temporary fix:
+
+```bash
+mkdir -p ~/.aionui-config/skills/officecli-track-changes
+curl -fsSL https://raw.githubusercontent.com/NextDoorLaoHuang-HF/OfficeCLI/main/aionui-skill/SKILL.md \
+  -o ~/.aionui-config/skills/officecli-track-changes/SKILL.md
+```
+
+Then enable `officecli-track-changes` in AionUI Settings → Skills. See [aionui-skill/README.md](aionui-skill/README.md) for details.
+
 <!--
 yaml-frontmatter:
   name: officecli
