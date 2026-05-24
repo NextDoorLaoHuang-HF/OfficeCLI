@@ -1112,9 +1112,11 @@ public partial class WordHandler
             if (!string.IsNullOrEmpty(pTcAuthor)) pprChange.Author = pTcAuthor;
             if (!string.IsNullOrEmpty(pTcDate) && DateTime.TryParse(pTcDate, out var pTcDt))
                 pprChange.Date = pTcDt;
+            else
+                pprChange.Date = DateTime.UtcNow;
             pprChange.Id = !string.IsNullOrEmpty(pTcId)
                 ? pTcId
-                : (GenerateParaId().GetHashCode() & 0x7FFFFFFF).ToString();
+                : GetNextRevisionId().ToString();
             pprChange.AppendChild(new PreviousParagraphProperties());
             pProps.AppendChild(pprChange);
         }
@@ -1860,9 +1862,11 @@ public partial class WordHandler
             if (!string.IsNullOrEmpty(trackChangeDate)
                 && DateTime.TryParse(trackChangeDate, out var tcfDate))
                 rprChange.Date = tcfDate;
+            else
+                rprChange.Date = DateTime.UtcNow;
             rprChange.Id = !string.IsNullOrEmpty(trackChangeId)
                 ? trackChangeId
-                : (GenerateParaId().GetHashCode() & 0x7FFFFFFF).ToString();
+                : GetNextRevisionId().ToString();
             // Schema: w:rPrChange child of w:rPr; ECMA-376 §17.13.5.31.
             // Empty inner rPr is schema-valid (means "no recorded prior
             // property set" — minimal marker form).
@@ -1888,6 +1892,11 @@ public partial class WordHandler
                     if (wrapper is InsertedRun insW2) insW2.Date = tcDate;
                     else if (wrapper is DeletedRun delW2) delW2.Date = tcDate;
                 }
+                else
+                {
+                    if (wrapper is InsertedRun insW2b) insW2b.Date = DateTime.UtcNow;
+                    else if (wrapper is DeletedRun delW2b) delW2b.Date = DateTime.UtcNow;
+                }
                 if (!string.IsNullOrEmpty(trackChangeId))
                 {
                     if (wrapper is InsertedRun insW3) insW3.Id = trackChangeId;
@@ -1895,9 +1904,8 @@ public partial class WordHandler
                 }
                 else
                 {
-                    // Each ins/del needs a unique w:id. Reuse the paraId
-                    // counter to avoid colliding with anything Word writes.
-                    var fallbackId = (GenerateParaId().GetHashCode() & 0x7FFFFFFF).ToString();
+                    // Scan the document for the highest existing revision ID and use max+1.
+                    var fallbackId = GetNextRevisionId().ToString();
                     if (wrapper is InsertedRun insW4) insW4.Id = fallbackId;
                     else if (wrapper is DeletedRun delW4) delW4.Id = fallbackId;
                 }
@@ -1912,6 +1920,56 @@ public partial class WordHandler
                         t.Parent?.ReplaceChild(dt, t);
                     }
                 }
+                parentEl.ReplaceChild(wrapper, newRun);
+                wrapper.AppendChild(newRun);
+            }
+        }
+
+        // v5.10: trackChange=moveFrom/moveTo → <w:moveFrom>/<w:moveTo> wrapper.
+        // MoveFrom uses w:delText (same rule as w:del); MoveTo uses w:t (same
+        // rule as w:ins). In OOXML, moveFrom+moveTo must appear as a pair with
+        // matching author/date to represent a single "move" operation.
+        if (trackChangeKind == "movefrom")
+        {
+            var parentEl = newRun.Parent;
+            if (parentEl != null)
+            {
+                var wrapper = new MoveFromRun();
+                if (!string.IsNullOrEmpty(trackChangeAuthor))
+                    wrapper.Author = trackChangeAuthor;
+                if (!string.IsNullOrEmpty(trackChangeDate)
+                    && DateTime.TryParse(trackChangeDate, out var mfDate))
+                    wrapper.Date = mfDate;
+                else
+                    wrapper.Date = DateTime.UtcNow;
+                wrapper.Id = !string.IsNullOrEmpty(trackChangeId)
+                    ? trackChangeId : GetNextRevisionId().ToString();
+                // MoveFrom uses w:delText (same conversion as w:del)
+                foreach (var t in newRun.Elements<Text>().ToList())
+                {
+                    var dt = new DeletedText(t.Text ?? "") { Space = t.Space };
+                    t.Parent?.ReplaceChild(dt, t);
+                }
+                parentEl.ReplaceChild(wrapper, newRun);
+                wrapper.AppendChild(newRun);
+            }
+        }
+        if (trackChangeKind == "moveto")
+        {
+            var parentEl = newRun.Parent;
+            if (parentEl != null)
+            {
+                var wrapper = new MoveToRun();
+                if (!string.IsNullOrEmpty(trackChangeAuthor))
+                    wrapper.Author = trackChangeAuthor;
+                if (!string.IsNullOrEmpty(trackChangeDate)
+                    && DateTime.TryParse(trackChangeDate, out var mtDate))
+                    wrapper.Date = mtDate;
+                else
+                    wrapper.Date = DateTime.UtcNow;
+                wrapper.Id = !string.IsNullOrEmpty(trackChangeId)
+                    ? trackChangeId : GetNextRevisionId().ToString();
+                // MoveTo uses w:t (same as w:ins) — no text conversion needed
                 parentEl.ReplaceChild(wrapper, newRun);
                 wrapper.AppendChild(newRun);
             }

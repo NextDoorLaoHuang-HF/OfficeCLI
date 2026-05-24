@@ -1009,6 +1009,39 @@ public partial class WordHandler
             throw;
         }
         _doc.MainDocumentPart?.Document?.Save();
+
+        // v5.10: trackChange=format on section → <w:sectPrChange> inside <w:sectPr>.
+        // Records a section-format-change revision marker. For idempotency,
+        // replace any existing sectPrChange.
+        if ((properties.TryGetValue("trackChange", out var secTcKind)
+             || properties.TryGetValue("trackchange", out secTcKind))
+            && secTcKind?.Trim().ToLowerInvariant() == "format")
+        {
+            string? secTcAuthor = null;
+            string? secTcDate = null;
+            string? secTcId = null;
+            properties.TryGetValue("trackChange.author", out secTcAuthor);
+            if (secTcAuthor == null) properties.TryGetValue("trackchange.author", out secTcAuthor);
+            properties.TryGetValue("trackChange.date", out secTcDate);
+            if (secTcDate == null) properties.TryGetValue("trackchange.date", out secTcDate);
+            properties.TryGetValue("trackChange.id", out secTcId);
+            if (secTcId == null) properties.TryGetValue("trackchange.id", out secTcId);
+            sectPr.RemoveAllChildren<SectionPropertiesChange>();
+            var sectPrChange = new SectionPropertiesChange();
+            if (!string.IsNullOrEmpty(secTcAuthor)) sectPrChange.Author = secTcAuthor;
+            if (!string.IsNullOrEmpty(secTcDate) && DateTime.TryParse(secTcDate, out var secTcDt))
+                sectPrChange.Date = secTcDt;
+            else
+                sectPrChange.Date = DateTime.UtcNow;
+            sectPrChange.Id = !string.IsNullOrEmpty(secTcId)
+                ? secTcId : GetNextRevisionId().ToString();
+            sectPrChange.AppendChild(new PreviousSectionProperties());
+            InsertSectPrChildInOrder(sectPr, sectPrChange);
+        }
+        // Remove trackChange dotted keys from unsupported list
+        unsupported.RemoveAll(k => k.StartsWith("trackChange", StringComparison.OrdinalIgnoreCase)
+                                 || k.StartsWith("trackchange", StringComparison.OrdinalIgnoreCase));
+
         return unsupported;
     }
 

@@ -654,6 +654,117 @@ public partial class WordHandler
             LastAddUnsupportedProps.Add(key);
         }
 
+        // v5.10: trackChange=ins/del on table row → <w:ins>/<w:del> inside <w:trPr>.
+        // Table-level revision markers are NOT wrappers (unlike InsertedRun/DeletedRun);
+        // they are markers inside trPr. Same pattern as MiniMax TrackChangesSamples.
+        if ((properties.TryGetValue("trackChange", out var trTcKind)
+             || properties.TryGetValue("trackchange", out trTcKind))
+            && (trTcKind?.Trim().ToLowerInvariant() == "ins"
+                || trTcKind?.Trim().ToLowerInvariant() == "del"))
+        {
+            var kind = trTcKind.Trim().ToLowerInvariant();
+            string? trTcAuthor = null;
+            string? trTcDate = null;
+            string? trTcId = null;
+            properties.TryGetValue("trackChange.author", out trTcAuthor);
+            if (trTcAuthor == null) properties.TryGetValue("trackchange.author", out trTcAuthor);
+            properties.TryGetValue("trackChange.date", out trTcDate);
+            if (trTcDate == null) properties.TryGetValue("trackchange.date", out trTcDate);
+            properties.TryGetValue("trackChange.id", out trTcId);
+            if (trTcId == null) properties.TryGetValue("trackchange.id", out trTcId);
+            newRowProps ??= newRow.PrependChild(new TableRowProperties());
+            if (kind == "ins")
+            {
+                var marker = new Inserted();
+                if (!string.IsNullOrEmpty(trTcAuthor)) marker.Author = trTcAuthor;
+                else marker.Author = "";
+                if (!string.IsNullOrEmpty(trTcDate) && DateTime.TryParse(trTcDate, out var trDate))
+                    marker.Date = trDate;
+                else
+                    marker.Date = DateTime.UtcNow;
+                marker.Id = !string.IsNullOrEmpty(trTcId) ? trTcId : GetNextRevisionId().ToString();
+                newRowProps.AppendChild(marker);
+            }
+            else // del
+            {
+                var marker = new Deleted();
+                if (!string.IsNullOrEmpty(trTcAuthor)) marker.Author = trTcAuthor;
+                else marker.Author = "";
+                if (!string.IsNullOrEmpty(trTcDate) && DateTime.TryParse(trTcDate, out var trDate))
+                    marker.Date = trDate;
+                else
+                    marker.Date = DateTime.UtcNow;
+                marker.Id = !string.IsNullOrEmpty(trTcId) ? trTcId : GetNextRevisionId().ToString();
+                newRowProps.AppendChild(marker);
+            }
+
+            // Word requires cell-paragraph runs to also be wrapped in ins/del
+            // for the row-level revision to render correctly. Without this,
+            // Word shows no revision mark for the row content.
+            // A date attribute is required — default to now if omitted.
+            var author = trTcAuthor ?? "";
+            var revDate = DateTime.UtcNow;
+            if (trTcDate != null && DateTime.TryParse(trTcDate, out var parsedDate))
+                revDate = parsedDate;
+
+            foreach (var tc in newRow.Elements<TableCell>())
+            {
+                foreach (var para in tc.Elements<Paragraph>())
+                {
+                    var runs = para.Elements<Run>().ToList();
+                    if (runs.Count == 0) continue;
+
+                    if (kind == "ins")
+                    {
+                        var wrapper = new InsertedRun();
+                        wrapper.Author = author;
+                        wrapper.Date = revDate;
+                        wrapper.Id = GetNextRevisionId().ToString();
+                        // Insert wrapper before first run
+                        para.InsertBefore(wrapper, runs[0]);
+                        foreach (var r in runs)
+                        {
+                            wrapper.AppendChild(r.CloneNode(true));
+                            r.Remove();
+                        }
+                    }
+                    else // del
+                    {
+                        var wrapper = new DeletedRun();
+                        wrapper.Author = author;
+                        wrapper.Date = revDate;
+                        wrapper.Id = GetNextRevisionId().ToString();
+                        // Convert w:t → w:delText inside wrapper
+                        para.InsertBefore(wrapper, runs[0]);
+                        foreach (var r in runs)
+                        {
+                            var cloned = (Run)r.CloneNode(true);
+                            var text = cloned.GetFirstChild<Text>();
+                            if (text != null)
+                            {
+                                var delText = new DeletedText { Space = text.Space, Text = text.Text };
+                                text.Remove();
+                                var rPr = cloned.GetFirstChild<RunProperties>();
+                                if (rPr != null)
+                                    cloned.InsertAfter(delText, rPr);
+                                else
+                                    cloned.PrependChild(delText);
+                            }
+                            wrapper.AppendChild(cloned);
+                            r.Remove();
+                        }
+                    }
+                }
+            }
+        }
+        // Skip trackChange dotted keys from falling into unsupported
+        foreach (var key in properties.Keys.ToList())
+        {
+            if (key.StartsWith("trackChange.", StringComparison.OrdinalIgnoreCase)
+                || key.StartsWith("trackchange.", StringComparison.OrdinalIgnoreCase))
+                LastAddUnsupportedProps.Remove(key); // consumed, not unsupported
+        }
+
         if (index.HasValue)
         {
             var existingRows = targetTable.Elements<TableRow>().ToList();
