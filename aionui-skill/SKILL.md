@@ -9,50 +9,54 @@ When the user asks to review, audit, redline, or revise a document with tracked 
 
 ## CRITICAL: In-place revision workflow
 
-**Do NOT use bare `add run` to create revisions** — it appends to the end of the paragraph, producing: `original text ~~deleted text~~ <u>inserted text</u>`. This is wrong.
+**Do NOT use bare `add run --prop trackChange=del/ins` on an existing paragraph** — it appends to the end, producing: `original text ~~deleted~~ <u>inserted</u>`. This duplicates text instead of marking the original.
 
-### Correct workflow: find → remove → add del+ins at anchor
+### Step-by-step: Replace text with tracked change
 
-For each change (e.g. replacing "3个工作日" with "5个工作日"):
+For each change (e.g. replacing "8" with "4"):
 
 ```bash
-FILE="your-file.docx"
+# Step 0: Read the paragraph run structure FIRST
+officecli get "$FILE" '/body/p[N]' --depth 2
+# This shows you each run and its text. The target text may be split
+# across multiple runs (e.g. "8" in r[3], "小时" in r[4]).
 
-# Step 1: Use `set` with `find` to split the target text into its own run.
-#    (The format prop is just to trigger the split; `color=auto` is a no-op.)
-officecli set "$FILE" '/body/p[N]' --prop find="3个工作日" --prop color=auto
-#    Result: r[1]="...前" r[2]="3个工作日" r[3]="后..."
+# Step 1: Use `set` with `find` to isolate the target text into its own run.
+# find only matches within a SINGLE run, so use the minimal unique text.
+# If the target is a number like "8" that's already in its own run, find="8" works.
+# If text spans runs, find the portion that IS in one run.
+officecli set "$FILE" '/body/p[N]' --prop find="8" --prop color=auto
+#   Result: r[1]="...前" r[2]="8" r[3]="...后"
 
 # Step 2: Remove the original (unmarked) run.
 officecli remove "$FILE" '/body/p[N]/r[2]'
-#    Result: r[1]="...前" r[2]="后..."
 
-# Step 3: Add ins run AFTER the preceding run (r[1]).
+# Step 3: Add ins run AFTER the preceding run (the run just before where the text was).
 officecli add "$FILE" '/body/p[N]' --type run --after '/body/p[N]/r[1]' \
-  --prop trackChange=ins --prop trackChange.author=AI --prop text="5个工作日"
-#    Result: r[1]="...前" r[2]=<ins>"5个工作日"</ins> r[3]="后..."
+  --prop trackChange=ins --prop trackChange.author=AI --prop text="4"
 
 # Step 4: Add del run AFTER the same preceding run (r[1]).
-#    Since both use --after r[1], the second one goes after the first → correct order.
 officecli add "$FILE" '/body/p[N]' --type run --after '/body/p[N]/r[1]' \
-  --prop trackChange=del --prop trackChange.author=AI --prop text="3个工作日"
-#    Result: r[1]="...前" r[2]=<ins>"5个工作日"</ins> r[3]=<del>"3个工作日"</del> r[4]="后..."
-#    Note: ins appears before del in markup, but Word renders both correctly.
+  --prop trackChange=del --prop trackChange.author=AI --prop text="8"
+# Final: r[1]="...前" r[2]=<ins>"4"</ins> r[3]=<del>"8"</del> r[4]="...后"
 ```
 
-### Why this works
+### Handling cross-run text
 
-1. `set --prop find=X` auto-splits runs so the target text becomes a standalone run
-2. `remove` deletes the original unmarked text
-3. Two `add run --after` with the same anchor both insert right after r[1]
-4. The second add pushes the first one forward, resulting in: ins, del, then the rest
+Real-world documents often split text across runs (e.g. `"【"` + `"8"` + `"】小时"`). Strategy:
 
-### Verify
+1. **Read run structure first** with `officecli get '/body/p[N]' --depth 2`
+2. **Find the smallest unique portion** that exists in a single run
+3. For numbers in brackets like `【8】`, the number `8` is typically its own run — just `find="8"`
+4. If `find` fails, try a shorter/adjacent portion that IS within one run
+5. NEVER fall back to unpack/pack or python-docx — always find a way with officecli
 
-```bash
-officecli query "$FILE" revision          # list all revisions
-officecli view "$FILE" html               # visual: green underline=ins, red strikethrough=del
-```
+### When find doesn't match
+
+If `find` reports 0 matches:
+- The text is split across runs. Use `get --depth 2` to see actual run boundaries
+- Try matching just the number or keyword portion (e.g. `find="8"` instead of `find="8小时"`)
+- If multiple runs contain the same text, use `find` with enough context to be unique within a single run
 
 ## trackChange properties
 
@@ -66,15 +70,26 @@ officecli view "$FILE" html               # visual: green underline=ins, red str
 ## Other revision operations
 
 ```bash
+# Format change revision
+officecli add "$FILE" /body --type paragraph --prop trackChange=format --prop trackChange.author=AI --prop text="reformatted paragraph"
+
+# Move revision
+officecli add "$FILE" '/body/p[1]' --type run --prop trackChange=moveFrom --prop trackChange.author=AI --prop text="moved text"
+officecli add "$FILE" '/body/p[2]' --type run --prop trackChange=moveTo --prop trackChange.author=AI --prop text="moved text"
+
 # Enable Track Changes mode (new edits auto-tracked in Word)
 officecli set "$FILE" / --prop trackRevisions=true
 
 # Accept or reject all revisions
 officecli set "$FILE" / --prop acceptallchanges=all
 officecli set "$FILE" / --prop rejectallchanges=all
+```
 
-# Format change revision (append at end is OK for new paragraphs)
-officecli add "$FILE" /body --type paragraph --prop trackChange=format --prop trackChange.author=AI --prop text="reformatted paragraph"
+## Verify
+
+```bash
+officecli query "$FILE" revision          # list all revisions
+officecli view "$FILE" html               # visual: green underline=ins, red strikethrough=del
 ```
 
 ## Contract review pattern (common task)
@@ -83,18 +98,19 @@ officecli add "$FILE" /body --type paragraph --prop trackChange=format --prop tr
 FILE="contract_reviewed.docx"
 cp original.docx "$FILE"
 officecli open "$FILE"
-officecli view "$FILE" outline                 # see structure
-officecli view "$FILE" text                    # read full text
+officecli view "$FILE" outline
+officecli view "$FILE" text
 
-# For each change — use the in-place workflow above:
-# 1. set find to split the run
-# 2. remove the original run
-# 3. add ins after the preceding run
-# 4. add del after the preceding run
+# For each change:
+# 0. get --depth 2 to see run structure
+# 1. set find to isolate target text (use minimal unique portion within a single run)
+# 2. remove original run
+# 3. add ins after preceding run
+# 4. add del after preceding run
 
 officecli query "$FILE" revision
-officecli view "$FILE" html                    # visual check
+officecli view "$FILE" html
 officecli close "$FILE"
 ```
 
-**CRITICAL**: When user mentions "修订模式", "审查", "Track Changes", "redline", "revision", you MUST use the in-place revision workflow above. Never fall back to python-docx, docx.js, unpack/pack, or raw XML for revision marks. Never use bare `add run --prop trackChange=del/ins` without first splitting and removing the original run.
+**CRITICAL**: When user mentions "修订模式", "审查", "Track Changes", "redline", "revision", you MUST use the in-place revision workflow above. Never use bare `add run --prop trackChange=del/ins` without first splitting and removing the original run. Never fall back to python-docx, docx.js, unpack/pack, or raw XML for revision marks. If `find` fails, read the run structure and adjust — do NOT switch tools.
