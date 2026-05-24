@@ -189,6 +189,24 @@ public partial class WordHandler
                 return true;
             }
 
+            // v5.10: set trackRevisions=true/false to toggle <w:trackChanges/> in settings.
+            // When true, Word records subsequent edits as revision marks.
+            case "trackrevisions" or "trackchanges":
+            {
+                var settings = EnsureSettings();
+                if (IsTruthy(value))
+                {
+                    if (settings.GetFirstChild<TrackRevisions>() == null)
+                        settings.AppendChild(new TrackRevisions());
+                }
+                else
+                {
+                    settings.GetFirstChild<TrackRevisions>()?.Remove();
+                }
+                settings.Save();
+                return true;
+            }
+
             default:
                 return false;
         }
