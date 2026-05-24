@@ -357,28 +357,51 @@ When the user asks to review, audit, redline, or revise a document with tracked 
 
 **Do NOT use bare `add run --prop trackChange=del/ins` on an existing paragraph** — it appends to the end, producing: `original text ~~deleted~~ <u>inserted</u>`. This duplicates text instead of marking the original.
 
-For each change (e.g. replacing "3个工作日" with "5个工作日"):
+### Step-by-step: Replace text with tracked change
+
+For each change (e.g. replacing "8" with "4"):
 
 ```bash
-# Step 1: Use `set` with `find` to split the target text into its own run.
-officecli set "$FILE" '/body/p[N]' --prop find="3个工作日" --prop color=auto
-#   Result: r[1]="...前" r[2]="3个工作日" r[3]="后..."
+# Step 0: Read the paragraph run structure FIRST
+officecli get "$FILE" '/body/p[N]' --depth 2
+# This shows each run and its text. The target may be split
+# across runs (e.g. "8" in r[3], "小时" in r[4]).
+
+# Step 1: Use `set` with `find` to isolate the target into its own run.
+# find only matches within a SINGLE run. Use the minimal unique text.
+# If the target is a number like "8" already in its own run, find="8" works.
+officecli set "$FILE" '/body/p[N]' --prop find="8" --prop color=auto
+#   Result: r[1]="...前" r[2]="8" r[3]="...后"
 
 # Step 2: Remove the original (unmarked) run.
 officecli remove "$FILE" '/body/p[N]/r[2]'
-#   Result: r[1]="...前" r[2]="后..."
 
 # Step 3: Add ins run AFTER the preceding run (r[1]).
 officecli add "$FILE" '/body/p[N]' --type run --after '/body/p[N]/r[1]' \
-  --prop trackChange=ins --prop trackChange.author=AI --prop text="5个工作日"
-#   Result: r[1]="...前" r[2]=<ins>"5个工作日"</ins> r[3]="后..."
+  --prop trackChange=ins --prop trackChange.author=AI --prop text="4"
 
 # Step 4: Add del run AFTER the same preceding run (r[1]).
-#   Both use --after r[1]; the second add pushes the first forward.
 officecli add "$FILE" '/body/p[N]' --type run --after '/body/p[N]/r[1]' \
-  --prop trackChange=del --prop trackChange.author=AI --prop text="3个工作日"
-#   Result: r[1]="...前" r[2]=<ins>"5个工作日"</ins> r[3]=<del>"3个工作日"</del> r[4]="后..."
+  --prop trackChange=del --prop trackChange.author=AI --prop text="8"
+# Final: r[1]="...前" r[2]=<ins>"4"</ins> r[3]=<del>"8"</del> r[4]="...后"
 ```
+
+### Handling cross-run text
+
+Real-world documents often split text across runs (e.g. `"【"` + `"8"` + `"】小时"`). Strategy:
+
+1. **Read run structure first** with `officecli get '/body/p[N]' --depth 2`
+2. **Find the smallest unique portion** that exists in a single run
+3. For numbers in brackets like `【8】`, the number `8` is typically its own run — just `find="8"`
+4. If `find` fails, try a shorter/adjacent portion within one run
+5. **NEVER fall back to unpack/pack or python-docx** — always find a way with officecli
+
+### When find doesn't match
+
+If `find` reports 0 matches:
+- The text is split across runs. Use `get --depth 2` to see actual run boundaries
+- Try just the number or keyword (e.g. `find="8"` instead of `find="8小时"`)
+- If multiple runs contain the same text, add enough context to be unique within a single run
 
 ### Other revision operations
 
