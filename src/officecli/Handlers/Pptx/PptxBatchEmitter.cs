@@ -548,10 +548,20 @@ public static partial class PptxBatchEmitter
         // Append into /p:sld preserves OOXML schema order because we removed
         // the corresponding props upstream: the slide carries neither
         // <p:transition> nor <p:timing> at this point in replay.
+        // R42-B1: append slide-level children that the semantic emit path
+        // doesn't write. Order follows OOXML schema (cSld → clrMapOvr →
+        // transition → timing → extLst). Since the freshly-added slide
+        // carries none of these (semantic emit covered only cSld and the
+        // optional <p:transition> via prop), an "append on /p:sld" sequence
+        // in schema order produces a schema-valid result.
+        if (exotic.ClrMapOvrXml != null)
+            EmitRawSlideSlice(slidePath, "p:clrMapOvr", exotic.ClrMapOvrXml, items, ctx);
         if (exotic.HasExoticTransition && exotic.TransitionXml != null)
             EmitRawSlideSlice(slidePath, "p:transition", exotic.TransitionXml, items, ctx);
         if (exotic.HasExoticTiming && exotic.TimingXml != null)
             EmitRawSlideSlice(slidePath, "p:timing", exotic.TimingXml, items, ctx);
+        if (exotic.ExtLstXml != null)
+            EmitRawSlideSlice(slidePath, "p:extLst", exotic.ExtLstXml, items, ctx);
 
         // SmartArt graphicFrames live in /p:sld/p:cSld/p:spTree but are
         // skipped by NodeBuilder (table/chart-only routing). Phase 3b emits
@@ -651,7 +661,18 @@ public static partial class PptxBatchEmitter
     /// </summary>
     private readonly record struct SlideExoticContent(
         bool HasExoticTransition, string? TransitionXml,
-        bool HasExoticTiming, string? TimingXml);
+        bool HasExoticTiming, string? TimingXml,
+        // R42-B1: two sld-level children that the semantic emit path never
+        // reads. Both round-trip via raw-set append on /p:sld, mirroring
+        // the transition/timing passthrough. Schema order under <p:sld>
+        // is cSld → clrMapOvr → transition → timing → extLst, so appending
+        // these in scan order (clrMapOvr before, extLst after) preserves
+        // ordering relative to the raw-emitted transition/timing slices.
+        // Plain (non-exotic) <p:timing> is owned by the animation index
+        // path; we deliberately do NOT raw-emit it here to avoid
+        // duplicating effects with the semantic add-animation rows.
+        string? ClrMapOvrXml,
+        string? ExtLstXml);
 
     private static SlideExoticContent ScanSlideExoticContent(PowerPointHandler ppt, string slidePath)
     {
@@ -752,7 +773,57 @@ public static partial class PptxBatchEmitter
             }
         }
 
-        return new SlideExoticContent(transExotic, transXml, timingExotic, timingXml);
+        // R42-B1: scan for <p:clrMapOvr> with a child <p:masterClrMapping/> or
+        // <p:overrideClrMapping ...>. The empty <p:clrMapOvr><p:masterClrMapping/>
+        // form is the default and conveys no information beyond "use master"
+        // (PowerPoint silently inserts it on every slide), so we still emit it
+        // to keep dump→replay byte-faithful. Captured by literal substring
+        // match — clrMapOvr never carries namespace-extension content.
+        string? clrMapOvrXml = null;
+        var cmIdx = xml.IndexOf("<p:clrMapOvr", StringComparison.Ordinal);
+        if (cmIdx >= 0)
+        {
+            var sliceEnd = SliceEnd(xml, cmIdx, "p:clrMapOvr");
+            if (sliceEnd > cmIdx)
+                clrMapOvrXml = xml.Substring(cmIdx, sliceEnd - cmIdx);
+        }
+
+        // R42-B1: scan for <p:extLst> directly under <p:sld>. Slide-level
+        // extLst typically carries section IDs, slide-id markers, and other
+        // extension content the semantic path doesn't model. We capture the
+        // last <p:extLst>...</p:extLst> in the doc because shapes inside
+        // spTree may also carry their own extLst — those round-trip via the
+        // shape passthrough. Slide-level extLst always appears AFTER timing,
+        // so the right anchor is the last occurrence not nested in a shape.
+        // Heuristic: scan for </p:timing> or </p:cSld> and take any extLst
+        // appearing AFTER all of those, before </p:sld>.
+        string? extLstXml = null;
+        var sldEnd = xml.LastIndexOf("</p:sld>", StringComparison.Ordinal);
+        if (sldEnd > 0)
+        {
+            // Find the last <p:extLst that begins after the spTree close.
+            var spTreeEnd = xml.LastIndexOf("</p:spTree>", sldEnd, StringComparison.Ordinal);
+            var anchor = spTreeEnd > 0 ? spTreeEnd : xml.IndexOf("</p:cSld>", StringComparison.Ordinal);
+            if (anchor > 0)
+            {
+                var eIdx = xml.IndexOf("<p:extLst", anchor, StringComparison.Ordinal);
+                while (eIdx > 0 && eIdx < sldEnd)
+                {
+                    var eEnd = SliceEnd(xml, eIdx, "p:extLst");
+                    if (eEnd > eIdx && eEnd <= sldEnd)
+                    {
+                        extLstXml = xml.Substring(eIdx, eEnd - eIdx);
+                        // Only one slide-level extLst is legal per schema;
+                        // stop at the first match past the spTree close.
+                        break;
+                    }
+                    eIdx = xml.IndexOf("<p:extLst", eIdx + 1, StringComparison.Ordinal);
+                }
+            }
+        }
+
+        return new SlideExoticContent(transExotic, transXml, timingExotic, timingXml,
+            clrMapOvrXml, extLstXml);
     }
 
     // Normalize a slide raw slice into a stable textual form so the first-pass
