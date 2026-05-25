@@ -24,6 +24,16 @@ public partial class WordHandler
         if (IsRevisionSelectorPath(path))
             return SetRevisionsBySelector(path, properties);
 
+        // Native-path accept/reject: `set /body/p[N] --prop revision=accept`,
+        // `set /body/p[N]/r[M] --prop revision=reject`, etc. — accept/reject
+        // every revision marker structurally tied to that element. Routed
+        // BEFORE the rest of the dispatch so `revision=accept|reject` isn't
+        // misinterpreted by the creation-side Set.TrackChange decorator
+        // (which would otherwise treat `revision=reject` as a creation kind
+        // and stamp a fresh pPrChange/rPrChange).
+        if (IsRevisionActionRequest(properties))
+            return SetRevisionByNativePath(path, properties);
+
         // Batch Set: if path looks like a selector (not starting with /), Query → Set each
         if (!string.IsNullOrEmpty(path) && !path.StartsWith("/"))
         {

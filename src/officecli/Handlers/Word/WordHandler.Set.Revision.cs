@@ -45,6 +45,100 @@ public partial class WordHandler
     /// path that the revision dispatcher should claim. Matches bare `revision`,
     /// `revision[...attr-filter...]`, and `/revision[N]` (the indexed form
     /// surfaced by `query revision`).</summary>
+    /// <summary>True when <paramref name="properties"/> carries
+    /// `revision=accept` or `revision=reject` — i.e. the caller is asking
+    /// for an ACTION on existing revisions, not creating a new one. Used to
+    /// route native-path mutations (`/body/p[N]/r[M]`) to
+    /// <see cref="SetRevisionByNativePath"/> instead of the creation-side
+    /// Set.TrackChange decorator.
+    ///
+    /// Mixing the action form with any creation sub-key (revision.author /
+    /// revision.date / revision.id) is rejected up-front in the dispatcher
+    /// as an ambiguous intent — accept/reject takes no attribution.</summary>
+    private static bool IsRevisionActionRequest(Dictionary<string, string> properties)
+    {
+        if (!properties.TryGetValue("revision", out var v)) return false;
+        var lower = v?.Trim().ToLowerInvariant();
+        return lower is "accept" or "reject";
+    }
+
+    /// <summary>Accept/reject every revision marker structurally tied to the
+    /// element addressed by <paramref name="path"/>. "Tied" means the marker
+    /// is the element itself, lives inside the element's subtree (e.g.
+    /// pPrChange inside a paragraph's pPr), or wraps the element (a Run
+    /// inside an InsertedRun/DeletedRun/MoveFrom/MoveToRun). Markers on
+    /// unrelated descendants — e.g. revisions inside other paragraphs that
+    /// happen to be inside the same parent body — are NOT touched; scope
+    /// follows the structural relationship, not document order.
+    ///
+    /// 0 matches → throw. 1+ matches → apply action in reverse document
+    /// order so removing earlier siblings doesn't invalidate later refs.
+    /// Mixing with revision.* attribution keys → throw (ambiguous intent).</summary>
+    internal List<string> SetRevisionByNativePath(string path, Dictionary<string, string> properties)
+    {
+        Modified = true;
+        var unsupported = new List<string>();
+
+        if (!properties.TryGetValue("revision", out var action))
+            throw new ArgumentException("revision action requires --prop revision=accept|reject");
+        var act = action.Trim().ToLowerInvariant();
+        if (act is not ("accept" or "reject"))
+            throw new ArgumentException(
+                $"revision must be `accept` or `reject` (got `{action}`)");
+        // Reject mixing action + creation attribution — accept/reject takes
+        // no author/date/id. If the caller wanted attribution, they meant
+        // the creation form (revision=ins/del/format + revision.author=...).
+        foreach (var k in properties.Keys)
+        {
+            if (k.StartsWith("revision.", StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException(
+                    $"revision={act} (action) cannot be mixed with `{k}` "
+                    + "(creation attribution); use one form at a time");
+        }
+
+        var parts = ParsePath(path);
+        var target = NavigateToElement(parts)
+            ?? throw new ArgumentException($"Path not found: {path}");
+
+        var matching = EnumerateRevisions()
+            .Where(r => RevisionTiedToElement(r.Element, target))
+            .ToList();
+        if (matching.Count == 0)
+            throw new ArgumentException(
+                $"{path} has no revision markers; use `query revision` to locate one, "
+                + "then `set /revision[N]` or `set /revision[@filter]` to accept/reject");
+
+        matching.Reverse();
+        foreach (var rev in matching)
+        {
+            if (act == "accept") AcceptRevision(rev);
+            else RejectRevision(rev);
+        }
+        _doc.MainDocumentPart?.Document?.Save();
+        return unsupported;
+    }
+
+    /// <summary>True when <paramref name="marker"/> is structurally tied to
+    /// <paramref name="target"/> — same element, descendant of target, or
+    /// (for run-wrapping marker types) an ancestor of target.</summary>
+    private static bool RevisionTiedToElement(OpenXmlElement marker, OpenXmlElement target)
+    {
+        if (ReferenceEquals(marker, target)) return true;
+        // Marker lives inside target's subtree (pPrChange under paragraph,
+        // InsertedRun child of paragraph, tcPrChange under cell, …).
+        if (marker.Ancestors().Any(a => ReferenceEquals(a, target))) return true;
+        // Marker wraps target (target is the inner Run of an InsertedRun /
+        // DeletedRun / MoveFromRun / MoveToRun). Restricted to these four
+        // wrapper types so `set /body/p[1] --prop revision=accept` doesn't
+        // also pick up sectPrChange / tblPrChange at parent scope.
+        if (marker is InsertedRun || marker is DeletedRun
+            || marker is MoveFromRun || marker is MoveToRun)
+        {
+            if (target.Ancestors().Any(a => ReferenceEquals(a, marker))) return true;
+        }
+        return false;
+    }
+
     private static bool IsRevisionSelectorPath(string path)
     {
         if (string.IsNullOrEmpty(path)) return false;
