@@ -1246,6 +1246,29 @@ public partial class WordHandler
     /// </summary>
     private static void BuildAbstractNumElement(Numbering numbering, int abstractNumId, Dictionary<string, string> properties)
     {
+        // CONSISTENCY(numbering-alias): mirror AddLvl which accepts both
+        // curated names (format/text) and OOXML attribute names
+        // (numFmt/fmt/lvlText). Without these, `get level[0]` returns
+        // canonical `format=…/lvlText=…` and feeding the same keys back
+        // into `add abstractNum` reports UNSUPPORTED — round-trip break.
+        // Normalize aliases in-place so downstream TryGetValue lookups
+        // consume them (and TrackingPropertyDictionary stops flagging
+        // them as unused).
+        void Alias(string from, string to)
+        {
+            if (properties.TryGetValue(from, out var v) && !properties.ContainsKey(to))
+                properties[to] = v;
+        }
+        Alias("fmt", "format");
+        Alias("numFmt", "format");
+        Alias("lvlText", "text");
+        for (int aliasLvl = 0; aliasLvl < 9; aliasLvl++)
+        {
+            Alias($"level{aliasLvl}.fmt", $"level{aliasLvl}.format");
+            Alias($"level{aliasLvl}.numFmt", $"level{aliasLvl}.format");
+            Alias($"level{aliasLvl}.lvlText", $"level{aliasLvl}.text");
+        }
+
         var abstractNum = new AbstractNum { AbstractNumberId = abstractNumId };
 
         // Schema order inside abstractNum:
