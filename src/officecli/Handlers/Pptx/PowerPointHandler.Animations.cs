@@ -1196,6 +1196,18 @@ public partial class PowerPointHandler
             // value instead of falling through to the hardcoded 500ms default.
             if (durationMs > 0)
                 tplEffectCTn.Duration = durationMs.ToString();
+            // L2 attributes (repeat / restart / autoReverse). Template effects
+            // (spin, pulse, boomerang, ...) previously dropped these on the
+            // floor because the early-return template branch never reached the
+            // non-template assignment below. Apply them on the same effectCTn
+            // so the OOXML reflects @repeatCount / @restart / @autoRev exactly
+            // as the non-template path does.
+            // CONSISTENCY(animation-l2): mirror BuildClickGroup non-template branch.
+            var tplRepeatOoxml = FormatAnimRepeatOoxml(repeat);
+            if (tplRepeatOoxml != null) tplEffectCTn.RepeatCount = tplRepeatOoxml;
+            var tplRestartEnum = ParseAnimRestart(restart);
+            if (tplRestartEnum != null) tplEffectCTn.Restart = tplRestartEnum.Value;
+            if (autoReverse.HasValue) tplEffectCTn.AutoReverse = autoReverse.Value;
             var tplEffectPar = new ParallelTimeNode { CommonTimeNode = tplEffectCTn };
             var tplMidId = nextId++;
             var tplMidCTn = new CommonTimeNode
