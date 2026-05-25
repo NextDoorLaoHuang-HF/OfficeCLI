@@ -1257,6 +1257,57 @@ public partial class PowerPointHandler
             throw new ArgumentException(
                 $"Invalid selector '{selector}': path-style selectors starting with '/' are not allowed in query. Use the element name (e.g. 'shape', 'slide') or a typed selector (e.g. 'shape[text=Hello]').");
 
+        // CSS comma-list union: split on top-level commas (outside [] and ()),
+        // recurse Query() on each part, dedupe by node identity (Path+Type).
+        // Without this, "chart, table" silently collapsed to just `chart` —
+        // the bare-word type-match loop below only ever sees the first token.
+        if (!string.IsNullOrEmpty(selector) && ContainsTopLevelComma(selector))
+        {
+            var parts = SplitTopLevelCommas(selector);
+            var union = new List<DocumentNode>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var part in parts)
+            {
+                var trimmed = part.Trim();
+                if (trimmed.Length == 0) continue;
+                foreach (var n in Query(trimmed))
+                {
+                    var key = (n.Path ?? "") + "\x00" + (n.Type ?? "");
+                    if (seen.Add(key)) union.Add(n);
+                }
+            }
+            return union;
+        }
+
+        // Unsupported CSS combinators: `+` (adjacent sibling) and `~` (general
+        // sibling) silently degraded to "first-token only" because the parser
+        // never looked past the leading bareword. Detect them at top level
+        // (outside [] / quotes) and reject with a clear pointer — silent
+        // wrong-answers are the worst failure mode for agent scripts.
+        var unsupportedCombinator = FindUnsupportedCombinator(selector);
+        if (unsupportedCombinator != null)
+            throw new CliException(
+                $"Unsupported combinator '{unsupportedCombinator}' in selector '{selector}'. " +
+                $"`+` (adjacent sibling) and `~` (general sibling) are not supported.")
+            {
+                Code = "invalid_selector",
+                Suggestion = "Use a comma list (`chart, table`) for union, or filter on a single element type and post-filter."
+            };
+
+        // Descendant combinator `A B` (whitespace-separated tokens) — only
+        // `slide ...` is supported (ancestor scoping); anything else (e.g.
+        // `chart table`) silently fell through to "match first token" and
+        // returned charts. Reject explicitly.
+        var unsupportedDescendant = FindUnsupportedDescendant(selector);
+        if (unsupportedDescendant != null)
+            throw new CliException(
+                $"Unsupported descendant combinator in selector '{selector}': " +
+                $"only `slide X` ancestor scoping is supported, not `{unsupportedDescendant}`.")
+            {
+                Code = "invalid_selector",
+                Suggestion = "Use a slide-scoped form (`slide chart`) or query the inner element directly."
+            };
+
         var results = new List<DocumentNode>();
         var parsed = ParseShapeSelector(selector);
         bool isEquationSelector = parsed.ElementType is "equation" or "math" or "formula";

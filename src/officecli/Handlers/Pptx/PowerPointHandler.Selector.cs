@@ -14,6 +14,122 @@ public partial class PowerPointHandler
         string? FontEquals, string? FontNotEquals, bool? IsTitle, bool? HasAlt,
         Dictionary<string, (string Value, bool Negate)>? Attributes = null);
 
+    private static bool ContainsTopLevelComma(string selector)
+    {
+        int depthBracket = 0, depthParen = 0;
+        char? quote = null;
+        foreach (var c in selector)
+        {
+            if (quote.HasValue) { if (c == quote.Value) quote = null; continue; }
+            if (c == '"' || c == '\'') { quote = c; continue; }
+            if (c == '[') depthBracket++;
+            else if (c == ']') depthBracket = Math.Max(0, depthBracket - 1);
+            else if (c == '(') depthParen++;
+            else if (c == ')') depthParen = Math.Max(0, depthParen - 1);
+            else if (c == ',' && depthBracket == 0 && depthParen == 0) return true;
+        }
+        return false;
+    }
+
+    private static List<string> SplitTopLevelCommas(string selector)
+    {
+        var parts = new List<string>();
+        int depthBracket = 0, depthParen = 0;
+        char? quote = null;
+        int start = 0;
+        for (int i = 0; i < selector.Length; i++)
+        {
+            var c = selector[i];
+            if (quote.HasValue) { if (c == quote.Value) quote = null; continue; }
+            if (c == '"' || c == '\'') { quote = c; continue; }
+            if (c == '[') depthBracket++;
+            else if (c == ']') depthBracket = Math.Max(0, depthBracket - 1);
+            else if (c == '(') depthParen++;
+            else if (c == ')') depthParen = Math.Max(0, depthParen - 1);
+            else if (c == ',' && depthBracket == 0 && depthParen == 0)
+            {
+                parts.Add(selector.Substring(start, i - start));
+                start = i + 1;
+            }
+        }
+        parts.Add(selector.Substring(start));
+        return parts;
+    }
+
+    private static string? FindUnsupportedCombinator(string selector)
+    {
+        int depthBracket = 0, depthParen = 0;
+        char? quote = null;
+        for (int i = 0; i < selector.Length; i++)
+        {
+            var c = selector[i];
+            if (quote.HasValue) { if (c == quote.Value) quote = null; continue; }
+            if (c == '"' || c == '\'') { quote = c; continue; }
+            if (c == '[') depthBracket++;
+            else if (c == ']') depthBracket = Math.Max(0, depthBracket - 1);
+            else if (c == '(') depthParen++;
+            else if (c == ')') depthParen = Math.Max(0, depthParen - 1);
+            else if (depthBracket == 0 && depthParen == 0)
+            {
+                // `~=` is an attribute operator (must be inside [], but guard
+                // anyway). At top level a bare `~` or `+` is the sibling
+                // combinator.
+                if (c == '+') return "+";
+                if (c == '~' && (i + 1 >= selector.Length || selector[i + 1] != '='))
+                    return "~";
+            }
+        }
+        return null;
+    }
+
+    private static string? FindUnsupportedDescendant(string selector)
+    {
+        // Allowed descendant forms: leading `slide ...` (ancestor scoping
+        // already handled by ParseShapeSelector); also `slide[N] ...` and
+        // `slide > X`. Anything else with whitespace between two top-level
+        // tokens is rejected.
+        var trimmed = selector.TrimStart();
+        if (trimmed.Length == 0) return null;
+        if (Regex.IsMatch(trimmed, @"^slide(\s|>|\[)", RegexOptions.IgnoreCase))
+            return null;
+        // Look for whitespace between two top-level word-starting tokens.
+        int depthBracket = 0, depthParen = 0;
+        char? quote = null;
+        bool sawToken = false;
+        for (int i = 0; i < trimmed.Length; i++)
+        {
+            var c = trimmed[i];
+            if (quote.HasValue) { if (c == quote.Value) quote = null; continue; }
+            if (c == '"' || c == '\'') { quote = c; continue; }
+            if (c == '[') { depthBracket++; sawToken = true; continue; }
+            if (c == ']') { depthBracket = Math.Max(0, depthBracket - 1); continue; }
+            if (c == '(') { depthParen++; sawToken = true; continue; }
+            if (c == ')') { depthParen = Math.Max(0, depthParen - 1); continue; }
+            if (depthBracket > 0 || depthParen > 0) continue;
+            if (char.IsWhiteSpace(c))
+            {
+                if (!sawToken) continue;
+                // Find the next non-space character — if it's a `>` it's a
+                // child combinator (handled elsewhere); if it starts another
+                // word token, it's an unsupported descendant combinator.
+                int j = i + 1;
+                while (j < trimmed.Length && char.IsWhiteSpace(trimmed[j])) j++;
+                if (j >= trimmed.Length) return null;
+                var next = trimmed[j];
+                if (next == '>' || next == '+' || next == '~' || next == ',') return null;
+                if (char.IsLetter(next) || next == '[' || next == '#' || next == '.' || next == ':')
+                {
+                    return trimmed.Substring(0, j) + "…";
+                }
+            }
+            else
+            {
+                sawToken = true;
+            }
+        }
+        return null;
+    }
+
     private static ShapeSelector ParseShapeSelector(string selector)
     {
         string? elementType = null;
@@ -252,8 +368,19 @@ public partial class PowerPointHandler
             }
             else
             {
-                // [attr=value]: must exist and equal
-                if (!hasKey) return false;
+                // [attr=value]: must exist and equal.
+                // CONSISTENCY(attr-miss-warn): when the key is absent, return
+                // true here (pass-through) so AttributeFilter.ApplyWithWarnings
+                // sees nodes.Count > 0 and emits the "filter key not found"
+                // warning. The CLI/Resident/MCP all post-filter through
+                // AttributeFilter which then rejects the node via MatchOne
+                // (!hasKey → false), so the final result set is identical.
+                // Direct Query() consumers don't use attribute filters; the
+                // pre-filter here was an optimisation, not a correctness gate.
+                // Without this pass-through, [foo=bar] silently returned empty
+                // with no warning, while the symmetric [foo] presence form
+                // warned because it parsed via the AttributeFilter path only.
+                if (!hasKey) continue;
                 var matches = isNameKey ? MatchesShapeName(actualStr, expected) : NormalizedEquals(actualStr, expected);
                 if (!matches)
                 {
