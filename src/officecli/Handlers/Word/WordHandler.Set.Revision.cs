@@ -365,6 +365,24 @@ public partial class WordHandler
                 }
             }
 
+            // Snapshot every row's existing tblPrEx (if any) BEFORE the
+            // wrap fires — Word's reviewing pane on Mac doesn't render
+            // <w:tblPrChange> on its own, only the per-row
+            // <w:tblPrExChange> cascade. To make table-level revisions
+            // visible there we mirror what Word itself does when the user
+            // changes a table property with Track Changes on: stamp every
+            // row with a tblPrEx + tblPrExChange whose snapshot is the
+            // row's prior tblPrEx (empty when absent — Mac Word doesn't
+            // require a real before/after diff in tblPrExChange, only that
+            // the marker exists). See WordBatchEmitter.Table.cs for the
+            // round-trip story.
+            var rowSnapshots = new List<(TableRow row, OpenXmlElement? prevTblPrEx)>();
+            foreach (var rowEl in tbl.Elements<TableRow>())
+            {
+                var existingPrEx = rowEl.GetFirstChild<TablePropertyExceptions>();
+                rowSnapshots.Add((rowEl, existingPrEx?.CloneNode(true)));
+            }
+
             Action wrap = () =>
             {
                 var tblPr = tbl.GetFirstChild<TableProperties>()
@@ -377,6 +395,44 @@ public partial class WordHandler
                 };
                 change.AppendChild(previous);
                 tblPr.AppendChild(change);
+
+                // Per-row tblPrEx + tblPrExChange cascade. Word for Mac
+                // keys its reviewing pane "Formatted Table" entry off
+                // this per-row marker rather than the table-level
+                // tblPrChange we just stamped above. The marker exists
+                // even when no per-row property actually changed — the
+                // snapshot mirrors the (now-baseline) tblPrEx the row
+                // carries after the wrap, same lie shape Word's own UI
+                // produces. Without the cascade Mac Word silently drops
+                // the table revision from the pane (verified 2026-05-25).
+                foreach (var (rowEl, prevEx) in rowSnapshots)
+                {
+                    var liveEx = rowEl.GetFirstChild<TablePropertyExceptions>();
+                    if (liveEx == null)
+                    {
+                        liveEx = new TablePropertyExceptions();
+                        rowEl.PrependChild(liveEx);
+                    }
+                    if (liveEx.GetFirstChild<TablePropertyExceptionsChange>() != null)
+                        continue;
+                    var prevExSnapshot = new PreviousTablePropertyExceptions();
+                    if (prevEx != null)
+                    {
+                        foreach (var child in prevEx.ChildElements)
+                        {
+                            if (child is TablePropertyExceptionsChange) continue;
+                            prevExSnapshot.AppendChild(child.CloneNode(true));
+                        }
+                    }
+                    var rowChange = new TablePropertyExceptionsChange
+                    {
+                        Author = author,
+                        Date = date,
+                        Id = idStr,
+                    };
+                    rowChange.AppendChild(prevExSnapshot);
+                    liveEx.AppendChild(rowChange);
+                }
             };
             return (stripped, wrap);
         }
