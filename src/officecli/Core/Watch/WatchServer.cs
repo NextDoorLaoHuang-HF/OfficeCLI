@@ -2035,27 +2035,27 @@ internal class WatchServer : IDisposable
 
     /// <summary>
     /// Handle POST /api/revision/accept — accept all tracked changes.
-    /// Spawns officecli set with acceptallchanges=all, waits for completion,
+    /// Spawns officecli set with revision.action=accept, waits for completion,
     /// then signals SSE clients with a "full" refresh.
     /// </summary>
     private async Task HandleRevisionAcceptAsync(NetworkStream stream, Dictionary<string, string> headers, string bodyPrefix, CancellationToken token)
     {
-        await RunRevisionActionAsync(stream, "acceptallchanges=all", token);
+        await RunRevisionActionAsync(stream, "revision.action=accept", token);
     }
 
     /// <summary>
     /// Handle POST /api/revision/reject — reject all tracked changes.
-    /// Spawns officecli set with rejectallchanges=all, waits for completion,
+    /// Spawns officecli set with revision.action=reject, waits for completion,
     /// then signals SSE clients with a "full" refresh.
     /// </summary>
     private async Task HandleRevisionRejectAsync(NetworkStream stream, Dictionary<string, string> headers, string bodyPrefix, CancellationToken token)
     {
-        await RunRevisionActionAsync(stream, "rejectallchanges=all", token);
+        await RunRevisionActionAsync(stream, "revision.action=reject", token);
     }
 
     /// <summary>
     /// Common helper for revision accept/reject actions.
-    /// Spawns officecli set with the given prop, returns 204 on success.
+    /// Spawns "officecli set <file> /revision --prop revision.action=..." returns 204 on success.
     /// After the command completes, sends a "full" SSE event to trigger
     /// a page refresh on all connected browsers.
     /// </summary>
@@ -2077,7 +2077,7 @@ internal class WatchServer : IDisposable
             };
             psi.ArgumentList.Add("set");
             psi.ArgumentList.Add(_filePath);
-            psi.ArgumentList.Add("/");
+            psi.ArgumentList.Add("/revision");
             psi.ArgumentList.Add("--prop");
             psi.ArgumentList.Add(propArg);
             using var proc = System.Diagnostics.Process.Start(psi);
