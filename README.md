@@ -1,5 +1,5 @@
 # OfficeCLI
-> **This is a fork** of [iOfficeAI/OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) maintained by [@NextDoorLaoHuang-HF](https://github.com/NextDoorLaoHuang-HF).
+> **This is a fork** of [iOfficeAI/OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) maintained by [@NextDoorLaoHuang-HF](https://github.com/NextDoorLaoHuang-HF), optimized for [AionUI](https://github.com/iOfficeAI/AionUi) preview.
 >
 > **Differences from upstream:**
 > - **HTML preview: Track Changes rendering** — revision marks (ins/del/format/move) are visually rendered in `view html` and Watch mode with distinct CSS styling

@@ -1,5 +1,13 @@
 # OfficeCLI
 
+> **这是 [iOfficeAI/OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) 的一个 fork**，由 [@NextDoorLaoHuang-HF](https://github.com/NextDoorLaoHuang-HF) 维护，为 [AionUI](https://github.com/iOfficeAI/AionUi) 预览体验优化。
+>
+> **相对于上游的差异：**
+> - **HTML 预览：修订模式（Track Changes）渲染** — 插入/删除/格式/移动标记在 `view html` 和 Watch 模式中以独立 CSS 样式可视化渲染
+> - **Watch 服务：修订 API 端点** — `POST /api/revision/accept`、`POST /api/revision/reject`、`GET /api/revision/count`，支持浏览器内接受/拒绝修订
+> - **修订工具栏** — Watch HTML 中注入浮动工具栏，显示修订计数徽章和接受/拒绝按钮
+>
+> 所有改动干净地 rebase 在上游 `main` 之上（领先 3 个提交）。构建方式不变：`dotnet publish -c Release -r osx-arm64 --self-contained -o out`。
 > **OfficeCLI 是全球首个、也是最好的专为 AI 智能体设计的 Office 套件。**
 
 **让任何 AI 智能体完全掌控 Word、Excel 和 PowerPoint——只需一行代码。**
