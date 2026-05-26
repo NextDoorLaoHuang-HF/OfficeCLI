@@ -1,7 +1,14 @@
 # OfficeCLI
+> **This is a fork** of [iOfficeAI/OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) maintained by [@NextDoorLaoHuang-HF](https://github.com/NextDoorLaoHuang-HF).
+>
+> **Differences from upstream:**
+> - **HTML preview: Track Changes rendering** — revision marks (ins/del/format/move) are visually rendered in `view html` and Watch mode with distinct CSS styling
+> - **Watch server: Revision API endpoints** — `POST /api/revision/accept`, `POST /api/revision/reject`, `GET /api/revision/count` for in-browser accept/reject controls
+> - **Revision toolbar** — floating toolbar injected into Watch HTML with revision count badge and accept/reject buttons
+>
+> All changes are cleanly rebased on upstream `main` (3 commits ahead). Build as usual: `dotnet publish -c Release -r osx-arm64 --self-contained -o out`.
 
 > **OfficeCLI is the world's first and the best Office suite designed for AI agents.**
-
 **Give any AI agent full control over Word, Excel, and PowerPoint — in one line of code.**
 
 Open-source. Single binary. No Office installation. No dependencies. Works everywhere.
