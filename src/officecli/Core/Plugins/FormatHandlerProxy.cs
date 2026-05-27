@@ -106,17 +106,25 @@ internal sealed class FormatHandlerProxy : IDocumentHandler
         return ParseAddPath(result);
     }
 
-    public string? Remove(string path)
+    public string? Remove(string path, Dictionary<string, string>? properties = null)
     {
-        var result = _session.Send("command", "remove", new JsonObject { ["path"] = path });
+        var args = new JsonObject { ["path"] = path };
+        var props = properties != null ? PropsToJson(properties) : null;
+        var result = _session.Send("command", "remove", args, props);
         return result?.GetValue<string>();
     }
 
-    public string Move(string sourcePath, string? targetParentPath, InsertPosition? position)
+    public string Move(string sourcePath, string? targetParentPath, InsertPosition? position, Dictionary<string, string>? properties = null)
     {
         var args = new JsonObject { ["source_path"] = sourcePath };
         if (targetParentPath is not null) args["target_parent_path"] = targetParentPath;
         if (position is not null) args["position"] = PositionToJson(position);
+        if (properties is not null && properties.Count > 0)
+        {
+            var propsJson = new JsonObject();
+            foreach (var kv in properties) propsJson[kv.Key] = kv.Value;
+            args["properties"] = propsJson;
+        }
         var result = _session.Send("command", "move", args);
         return result?.GetValue<string>() ?? "";
     }

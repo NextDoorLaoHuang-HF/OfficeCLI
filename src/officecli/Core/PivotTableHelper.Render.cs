@@ -1785,6 +1785,81 @@ internal static partial class PivotTableHelper
             return Reduce(collected, valueFields[d].func);
         }
 
+        // showDataAs post-processing for the tree-based renderer. The inline
+        // 1×1×K path uses ApplyShowDataAs1x1 on a pre-computed matrix;
+        // RenderGeneralPivot computes cells on demand via ComputeCell, so the
+        // transformation has to wrap each per-cell value with division by the
+        // relevant total. Mirrors the same set of modes (Excel's "Show Values
+        // As" semantics):
+        //
+        //   normal             — passthrough
+        //   percent_of_total   — v / grandTotal[d]
+        //   percent_of_row     — v / rowTotal(rowNode, d)
+        //   percent_of_col     — v / colTotal(colNode, d)
+        //   running_total      — NOT YET (needs col ordering context; raw value
+        //                        is returned, callers add a TODO marker)
+        //
+        // Recomputes totals per call for simplicity. With small pivots the
+        // O(rowsXcols) per-row scan is fine; bigger pivots could memoize but
+        // we keep the wrapper simple to match Excel's correctness first.
+        var grandAxisNode = new AxisNode(string.Empty, 0, Array.Empty<string>());
+        double TransformShowAs(double rawValue, AxisNode rowNode, AxisNode colNode, int d)
+        {
+            var mode = (valueFields[d].showAs ?? "").ToLowerInvariant();
+            switch (mode)
+            {
+                case "":
+                case "normal":
+                    return rawValue;
+                case "percent_of_total" or "percentoftotal" or "percent":
+                {
+                    var gt = ComputeCell(grandAxisNode, grandAxisNode, d);
+                    return gt == 0 ? rawValue : rawValue / gt;
+                }
+                case "percent_of_row" or "percentofrow":
+                {
+                    var rt = ComputeCell(rowNode, grandAxisNode, d);
+                    return rt == 0 ? rawValue : rawValue / rt;
+                }
+                case "percent_of_col" or "percent_of_column" or "percentofcol" or "percentofcolumn":
+                {
+                    var ct = ComputeCell(grandAxisNode, colNode, d);
+                    return ct == 0 ? rawValue : rawValue / ct;
+                }
+                case "running_total" or "runningtotal":
+                {
+                    // Cumulative sum across col positions. ONLY applied when
+                    // the aggregate is "sum" (the only case where running of
+                    // per-cell values equals Excel's "aggregate over the
+                    // cumulative set"). For var/varP/avg/count/etc., Excel
+                    // re-aggregates against the cumulative leaf set, which
+                    // we don't have machinery for; raw value is returned and
+                    // Refresh in Excel computes the correct cumulative.
+                    var func = (valueFields[d].func ?? "").ToLowerInvariant();
+                    if (func != "sum" && func != "") return rawValue;
+                    if (colPositions.Count == 0) return rawValue;
+                    double running = 0;
+                    bool found = false;
+                    foreach (var (pNode, pIsLeaf, pIsSubtotal) in colPositions)
+                    {
+                        if (pIsSubtotal) continue;
+                        running += ComputeCell(rowNode, pNode, d);
+                        if (object.ReferenceEquals(pNode, colNode))
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    return found ? running : rawValue;
+                }
+                default:
+                    return rawValue;
+            }
+        }
+
+        double ComputeCellShowAs(AxisNode rowNode, AxisNode colNode, int d)
+            => TransformShowAs(ComputeCell(rowNode, colNode, d), rowNode, colNode, d);
+
         bool HasAnyValue(AxisNode rowNode, AxisNode colNode)
         {
             var rPath = rowNode.Path;
@@ -2183,7 +2258,7 @@ internal static partial class PivotTableHelper
                         bool any = HasAnyValue(rowNode, colNode);
                         for (int d = 0; d < K; d++)
                         {
-                            var v = ComputeCell(rowNode, colNode, d);
+                            var v = ComputeCellShowAs(rowNode, colNode, d);
                             // Skip 0-value cells when there are no underlying values to
                             // mirror Excel's behavior of leaving sparse intersections blank.
                             if (any || v != 0)
@@ -2199,7 +2274,7 @@ internal static partial class PivotTableHelper
                     var emptyColNode = new AxisNode(string.Empty, 0, Array.Empty<string>());
                     for (int d = 0; d < K; d++)
                     {
-                        var v = ComputeCell(rowNode, emptyColNode, d);
+                        var v = ComputeCellShowAs(rowNode, emptyColNode, d);
                         row.AppendChild(MakeNumericCell(firstDataCol + d, rowIdx, v, valueStyleIds[d]));
                     }
                 }
@@ -2213,7 +2288,7 @@ internal static partial class PivotTableHelper
                 var grandRowNode = new AxisNode(string.Empty, 0, Array.Empty<string>());
                 for (int d = 0; d < K; d++)
                     row.AppendChild(MakeNumericCell(grandTotalColStart + d, rowIdx,
-                        ComputeCell(rowNode, grandRowNode, d), valueStyleIds[d]));
+                        ComputeCellShowAs(rowNode, grandRowNode, d), valueStyleIds[d]));
             }
             sheetData.AppendChild(row);
 
@@ -2264,7 +2339,7 @@ internal static partial class PivotTableHelper
                     var (colNode, _, _) = colPositions[cp];
                     for (int d = 0; d < K; d++)
                     {
-                        var v = ComputeCell(grandRowNodeFinal, colNode, d);
+                        var v = ComputeCellShowAs(grandRowNodeFinal, colNode, d);
                         grandRow.AppendChild(MakeNumericCell(colIdxByPosition[cp, d], grandRowIdx, v, valueStyleIds[d]));
                     }
                 }
@@ -2275,7 +2350,7 @@ internal static partial class PivotTableHelper
                 var emptyColNode = new AxisNode(string.Empty, 0, Array.Empty<string>());
                 for (int d = 0; d < K; d++)
                 {
-                    var v = ComputeCell(grandRowNodeFinal, emptyColNode, d);
+                    var v = ComputeCellShowAs(grandRowNodeFinal, emptyColNode, d);
                     grandRow.AppendChild(MakeNumericCell(firstDataCol + d, grandRowIdx, v, valueStyleIds[d]));
                 }
             }
@@ -2283,7 +2358,7 @@ internal static partial class PivotTableHelper
             {
                 for (int d = 0; d < K; d++)
                     grandRow.AppendChild(MakeNumericCell(grandTotalColStart + d, grandRowIdx,
-                        ComputeCell(grandRowNodeFinal, grandRowNodeFinal, d), valueStyleIds[d]));
+                        ComputeCellShowAs(grandRowNodeFinal, grandRowNodeFinal, d), valueStyleIds[d]));
             }
             sheetData.AppendChild(grandRow);
         }

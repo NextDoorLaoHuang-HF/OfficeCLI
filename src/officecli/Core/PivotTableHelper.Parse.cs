@@ -485,8 +485,10 @@ internal static partial class PivotTableHelper
         "max" => "Max",
         "min" => "Min",
         "product" => "Product",
-        "stddev" or "std" => "StdDev",
-        "stddevp" or "stdp" => "StdDevp",
+        // stddev/stddevp aliases include the schema-advertised "stdev"/"stdevp"
+        // (single 'd') for parser/schema parity.
+        "stddev" or "stdev" or "std" => "StdDev",
+        "stddevp" or "stdevp" or "stdp" => "StdDevp",
         "var" or "variance" => "Var",
         "varp" => "Varp",
         _ => "Sum",
@@ -520,8 +522,8 @@ internal static partial class PivotTableHelper
             "max" => DataConsolidateFunctionValues.Maximum,
             "min" => DataConsolidateFunctionValues.Minimum,
             "product" => DataConsolidateFunctionValues.Product,
-            "stddev" or "std" => DataConsolidateFunctionValues.StandardDeviation,
-            "stddevp" or "stdp" => DataConsolidateFunctionValues.StandardDeviationP,
+            "stddev" or "stdev" or "std" => DataConsolidateFunctionValues.StandardDeviation,
+            "stddevp" or "stdevp" or "stdp" => DataConsolidateFunctionValues.StandardDeviationP,
             "var" or "variance" => DataConsolidateFunctionValues.Variance,
             "varp" => DataConsolidateFunctionValues.VarianceP,
             // CONSISTENCY(strict-enums): mirror ParseShowDataAs / ParseFieldList —

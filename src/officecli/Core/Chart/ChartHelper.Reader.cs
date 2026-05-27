@@ -197,7 +197,19 @@ internal static partial class ChartHelper
             node.Format["legend"] = "none";
         }
 
-        var dataLabels = plotArea.Descendants<C.DataLabels>().FirstOrDefault();
+        // Chart-level dLbls lives as a direct child of the chart-group element
+        // (c:barChart, c:lineChart, ...). Using Descendants pulled the first
+        // series-level <c:dLbls> instead when it appeared earlier in XML order,
+        // causing chart-level labelFont readback to mirror series 1's font.
+        var dataLabels = plotArea.ChildElements
+            .OfType<OpenXmlCompositeElement>()
+            .Where(e => e is C.BarChart || e is C.LineChart || e is C.PieChart
+                || e is C.AreaChart || e is C.Area3DChart || e is C.ScatterChart
+                || e is C.DoughnutChart || e is C.Bar3DChart || e is C.Line3DChart
+                || e is C.Pie3DChart || e is C.OfPieChart || e is C.BubbleChart
+                || e is C.RadarChart || e is C.StockChart)
+            .Select(g => g.GetFirstChild<C.DataLabels>())
+            .FirstOrDefault(d => d != null);
         if (dataLabels != null)
         {
             var parts = new List<string>();
@@ -894,9 +906,7 @@ internal static partial class ChartHelper
                         {
                             "fixedVal" => "fixed",
                             "percentage" => "percent",
-                            "stdDev" => "stddev",
-                            "stdErr" => "stderr",
-                            _ => errValType.InnerText
+                            _ => errValType.InnerText  // OOXML camelCase: stdDev, stdErr, cust
                         };
                         // Magnitude lives in either <c:val>, or shared
                         // <c:plus>/<c:minus> NumericLiteral first point.
@@ -913,7 +923,7 @@ internal static partial class ChartHelper
                             var numStr = firstPt?.GetFirstChild<C.NumericValue>()?.Text;
                             if (!string.IsNullOrEmpty(numStr)) mag = numStr;
                         }
-                        seriesNode.Format["errbars"] = mag != null
+                        seriesNode.Format["errBars"] = mag != null
                             ? $"{typeName}:{mag}"
                             : typeName;
                     }
@@ -924,22 +934,76 @@ internal static partial class ChartHelper
                 // Explosion (pie)
                 var explosion = serEl?.GetFirstChild<C.Explosion>()?.Val?.Value;
                 if (explosion != null && explosion > 0) seriesNode.Format["explosion"] = explosion;
-                // Data point colors
+                // Per-series labelFont readback. Mirrors the chart-level
+                // labelFont readback above (line ~662) but scoped to this
+                // series' own <c:dLbls> — Setter ApplySeriesLabelFont writes
+                // here via series{N}.labelFont*=, and without per-series
+                // readback dump→replay loses the spec.
+                var serDLbls = serEl?.GetFirstChild<C.DataLabels>();
+                var serDlDefRp = serDLbls?.GetFirstChild<C.TextProperties>()
+                    ?.GetFirstChild<Drawing.Paragraph>()
+                    ?.GetFirstChild<Drawing.ParagraphProperties>()
+                    ?.GetFirstChild<Drawing.DefaultRunProperties>();
+                if (serDlDefRp != null)
+                {
+                    if (serDlDefRp.FontSize?.HasValue == true)
+                        seriesNode.Format["labelFont.size"] = $"{serDlDefRp.FontSize.Value / 100}pt";
+                    if (serDlDefRp.Bold?.HasValue == true && serDlDefRp.Bold.Value)
+                        seriesNode.Format["labelFont.bold"] = "true";
+                    var serDlLabelFill = serDlDefRp.GetFirstChild<Drawing.SolidFill>();
+                    if (serDlLabelFill != null)
+                    {
+                        var serDlLabelColor = ReadColorFromFill(serDlLabelFill);
+                        if (serDlLabelColor != null)
+                            seriesNode.Format["labelFont.color"] = serDlLabelColor;
+                    }
+                    var serDlLatin = serDlDefRp.GetFirstChild<Drawing.LatinFont>()?.Typeface?.Value;
+                    if (!string.IsNullOrEmpty(serDlLatin))
+                        seriesNode.Format["labelFont.name"] = serDlLatin;
+                }
+                // Data point colors + per-point marker / markerSize /
+                // markerColor / explosion. Mirrors the series-level readback
+                // above (markerSymbol/Size/spPr/SolidFill) so R38-B5 writer
+                // output round-trips through dump→replay; without these the
+                // dPt children are silently dropped on Get.
                 if (serEl != null)
                 {
                     foreach (var dPt in serEl.Elements<C.DataPoint>())
                     {
                         var ptIdx = dPt.Index?.Val?.Value;
                         if (ptIdx == null) continue;
+                        var ptNum = ptIdx.Value + 1;
                         var ptSpPr = dPt.GetFirstChild<C.ChartShapeProperties>();
                         if (ptSpPr?.GetFirstChild<Drawing.NoFill>() != null)
-                            seriesNode.Format[$"point{ptIdx.Value + 1}.color"] = "none";
+                            seriesNode.Format[$"point{ptNum}.color"] = "none";
                         var ptFill = ptSpPr?.GetFirstChild<Drawing.SolidFill>();
                         if (ptFill != null)
                         {
                             var ptColor = ReadColorFromFill(ptFill);
-                            if (ptColor != null) seriesNode.Format[$"point{ptIdx.Value + 1}.color"] = ptColor;
+                            if (ptColor != null) seriesNode.Format[$"point{ptNum}.color"] = ptColor;
                         }
+                        // <c:marker> child of <c:dPt>
+                        var ptMarker = dPt.GetFirstChild<C.Marker>();
+                        if (ptMarker != null)
+                        {
+                            var ptMarkerSymbol = ptMarker.GetFirstChild<C.Symbol>()?.Val;
+                            if (ptMarkerSymbol?.HasValue == true)
+                                seriesNode.Format[$"point{ptNum}.marker"] = ptMarkerSymbol.InnerText;
+                            var ptMarkerSize = ptMarker.GetFirstChild<C.Size>()?.Val;
+                            if (ptMarkerSize?.HasValue == true)
+                                seriesNode.Format[$"point{ptNum}.markerSize"] = (int)ptMarkerSize.Value;
+                            var ptMarkerFill = ptMarker.GetFirstChild<C.ChartShapeProperties>()
+                                ?.GetFirstChild<Drawing.SolidFill>();
+                            if (ptMarkerFill != null)
+                            {
+                                var ptmColor = ReadColorFromFill(ptMarkerFill);
+                                if (ptmColor != null) seriesNode.Format[$"point{ptNum}.markerColor"] = ptmColor;
+                            }
+                        }
+                        // <c:explosion> child of <c:dPt> — pie/doughnut slice offset
+                        var ptExplosion = dPt.GetFirstChild<C.Explosion>()?.Val;
+                        if (ptExplosion?.HasValue == true)
+                            seriesNode.Format[$"point{ptNum}.explosion"] = (int)ptExplosion.Value;
                     }
                 }
                 node.Children.Add(seriesNode);
@@ -1476,7 +1540,10 @@ internal static partial class ChartHelper
 
         var fill = defRp.GetFirstChild<Drawing.SolidFill>();
         var color = ReadColorFromFill(fill);
-        parts.Add(color?.TrimStart('#') ?? "");
+        // Canonical: hex colors are emitted with the "#" prefix (project
+        // CLAUDE.md). Earlier this stripped "#" via TrimStart, breaking the
+        // canonical form for axisFont / legendFont compound readback.
+        parts.Add(color ?? "");
 
         var font = defRp.GetFirstChild<Drawing.LatinFont>()?.Typeface?.Value;
         if (font != null)

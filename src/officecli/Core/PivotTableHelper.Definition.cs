@@ -134,7 +134,8 @@ internal static partial class PivotTableHelper
         List<int> filterFieldIndices, List<(int idx, string func, string showAs, string name)> valueFields,
         string styleName,
         uint?[]? columnNumFmtIds = null,
-        List<DateGroupSpec>? dateGroups = null)
+        List<DateGroupSpec>? dateGroups = null,
+        Dictionary<string, int>[]? fieldValueIndex = null)
     {
         var pivotDef = new PivotTableDefinition
         {
@@ -288,17 +289,25 @@ internal static partial class PivotTableHelper
                     if (!isInnermost)
                     {
                         // x14 extension on pivotField: <x14:pivotField ... /> with
-                        // repeatItemLabels="1" wrapped in <x:extLst><x:ext uri=...>.
+                        // fillDownLabels="1" wrapped in <x:extLst><x:ext uri=...>.
                         // The attribute is a 2009 extension, not part of the
                         // base schema (Open XML SDK 3.4 PivotField has no
                         // property for it), so we synthesize the ext element.
+                        //
+                        // Attribute name: the x14 schema's CT_PivotFieldX14
+                        // defines this as 'fillDownLabels'. The user-facing
+                        // property is exposed as 'repeatItemLabels' (and its
+                        // aliases) which maps to this same x14 attribute on
+                        // emit. Earlier officecli wrote 'repeatItemLabels'
+                        // directly, which is NOT a valid x14:pivotField
+                        // attribute and the validator rightly rejected it.
                         const string x14Ns = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
                         var pfExt = new PivotFieldExtension
                         {
                             Uri = "{2946ED86-A175-432a-8AC1-64E0C546D7DE}"
                         };
                         var x14Pf = new OpenXmlUnknownElement("x14", "pivotField", x14Ns);
-                        x14Pf.SetAttribute(new OpenXmlAttribute("repeatItemLabels", "", "1"));
+                        x14Pf.SetAttribute(new OpenXmlAttribute("fillDownLabels", "", "1"));
                         x14Pf.AddNamespaceDeclaration("x14", x14Ns);
                         pfExt.AppendChild(x14Pf);
                         var pfExtLst = pf.GetFirstChild<PivotFieldExtensionList>()
@@ -322,7 +331,18 @@ internal static partial class PivotTableHelper
                 if (isDerivedDateGroup)
                     AppendFixedBucketItems(pf, derivedFieldByIdx[i]);
                 else
-                    AppendFieldItems(pf, values);
+                {
+                    // Map each unique value to its position in cache.sharedItems
+                    // when available. Without this, items[i].Index = i assumes
+                    // unique-order == cache-order, which breaks on shared
+                    // caches built with a different sort mode (sheet 1 builds
+                    // cache desc → cache=W/S/N/E; sheet 16 unique=E/N/S/W
+                    // → items[0,1,2,3] would decode to W/S/N/E, contradicting
+                    // unique).
+                    var sharedItemsMap = (fieldValueIndex != null && i < fieldValueIndex.Length)
+                        ? fieldValueIndex[i] : null;
+                    AppendFieldItems(pf, values, sharedItemsMap);
+                }
                 // CONSISTENCY(subtotals-opts): defaultSubtotal=false on the
                 // pivotField tells Excel this axis field does not contribute
                 // an outer-level subtotal. Only emit the attribute when the
@@ -1208,7 +1228,8 @@ internal static partial class PivotTableHelper
         else if (container is ColumnItems ci) ci.Count = (uint)count;
     }
 
-    private static void AppendFieldItems(PivotField pf, string[] values)
+    private static void AppendFieldItems(PivotField pf, string[] values,
+        Dictionary<string, int>? sharedItemsMap = null)
     {
         var unique = values.Where(v => !string.IsNullOrEmpty(v)).Distinct().OrderByAxis(v => v).ToList();
         // CONSISTENCY(subtotals-opts): trailing <item t="default"/> is the
@@ -1217,7 +1238,18 @@ internal static partial class PivotTableHelper
         bool emitSub = ActiveDefaultSubtotal;
         var items = new Items { Count = (uint)(unique.Count + (emitSub ? 1 : 0)) };
         for (int i = 0; i < unique.Count; i++)
-            items.AppendChild(new Item { Index = (uint)i });
+        {
+            // When sharedItemsMap is provided (cache build computed value→
+            // cacheItemIdx for THIS field), use it so items[i].Index points
+            // to the actual cache.sharedItems position of unique[i]. Without
+            // the map we fall back to i — correct only when unique-order
+            // matches cache-order (single-pivot caches; broken on shared
+            // caches with mismatched sort modes).
+            uint cacheIdx = sharedItemsMap != null && sharedItemsMap.TryGetValue(unique[i], out var idx)
+                ? (uint)idx
+                : (uint)i;
+            items.AppendChild(new Item { Index = cacheIdx });
+        }
         if (emitSub)
             items.AppendChild(new Item { ItemType = ItemValues.Default });
         InsertItemsInPivotFieldOrder(pf, items);
@@ -1244,6 +1276,170 @@ internal static partial class PivotTableHelper
             items.AppendChild(new Item { Index = (uint)i });
         items.AppendChild(new Item { ItemType = ItemValues.Default });
         InsertItemsInPivotFieldOrder(pf, items);
+    }
+
+    /// <summary>
+    /// Emit a persistent &lt;filters&gt;&lt;filter type="captionBeginsWith"&gt; (or
+    /// other label-type) block so labelFilter survives Excel's Refresh.
+    /// Sibling of ApplyTopNPivotFilter; emits the CT_PivotFilter shape for
+    /// caption filters:
+    ///   &lt;filter fld=&quot;N&quot; type=&quot;captionBeginsWith&quot; evalOrder=&quot;-1&quot; id=&quot;1&quot; stringValue1=&quot;value&quot;&gt;
+    ///     &lt;autoFilter ref=&quot;A1&quot;&gt;
+    ///       &lt;filterColumn colId=&quot;0&quot;&gt;
+    ///         &lt;customFilters&gt;&lt;customFilter val=&quot;value*&quot;/&gt;&lt;/customFilters&gt;
+    /// </summary>
+    internal static void ApplyLabelPivotFilter(
+        PivotTableDefinition pivotDef,
+        int filterFieldIdx,
+        string opType,
+        string needle)
+    {
+        // Map officecli op to OOXML PivotFilterValues + customFilter wildcard.
+        // The customFilter.val attribute uses Excel's wildcard syntax:
+        //   beginsWith   → "needle*"
+        //   endsWith     → "*needle"
+        //   contains     → "*needle*"
+        //   doesNotContain → "*needle*" with operator="notEqual"
+        //   equals       → "needle"
+        //   notEquals    → "needle" with operator="notEqual"
+        PivotFilterValues filterType;
+        string customVal;
+        FilterOperatorValues? customOp = null;
+        switch (opType)
+        {
+            case "beginswith":
+                filterType = PivotFilterValues.CaptionBeginsWith; customVal = needle + "*"; break;
+            case "endswith":
+                filterType = PivotFilterValues.CaptionEndsWith; customVal = "*" + needle; break;
+            case "contains":
+                filterType = PivotFilterValues.CaptionContains; customVal = "*" + needle + "*"; break;
+            case "doesnotcontain":
+                filterType = PivotFilterValues.CaptionNotContains; customVal = "*" + needle + "*";
+                customOp = FilterOperatorValues.NotEqual; break;
+            case "equals":
+                filterType = PivotFilterValues.CaptionEqual; customVal = needle; break;
+            case "notequals":
+                filterType = PivotFilterValues.CaptionNotEqual; customVal = needle;
+                customOp = FilterOperatorValues.NotEqual; break;
+            default:
+                return;
+        }
+
+        var filters = pivotDef.GetFirstChild<PivotFilters>() ?? new PivotFilters();
+        var pivotFilter = new PivotFilter
+        {
+            Field = (uint)filterFieldIdx,
+            Type = filterType,
+            EvaluationOrder = -1,
+            Id = 1U,
+            StringValue1 = needle
+        };
+        var autoFilter = new AutoFilter { Reference = "A1" };
+        var filterColumn = new FilterColumn { ColumnId = 0U };
+        var customFilters = new CustomFilters();
+        var customFilter = new CustomFilter { Val = customVal };
+        if (customOp.HasValue) customFilter.Operator = customOp.Value;
+        customFilters.AppendChild(customFilter);
+        filterColumn.AppendChild(customFilters);
+        autoFilter.AppendChild(filterColumn);
+        pivotFilter.AppendChild(autoFilter);
+        filters.AppendChild(pivotFilter);
+        if (pivotDef.GetFirstChild<PivotFilters>() == null)
+        {
+            filters.Count = (uint)filters.Elements<PivotFilter>().Count();
+            var anchor = (OpenXmlElement?)pivotDef.GetFirstChild<RowHierarchiesUsage>()
+                ?? (OpenXmlElement?)pivotDef.GetFirstChild<ColumnHierarchiesUsage>()
+                ?? (OpenXmlElement?)pivotDef.GetFirstChild<PivotTableDefinitionExtensionList>();
+            if (anchor != null)
+                pivotDef.InsertBefore(filters, anchor);
+            else
+                pivotDef.AppendChild(filters);
+        }
+        else
+        {
+            filters.Count = (uint)filters.Elements<PivotFilter>().Count();
+        }
+    }
+
+    /// <summary>
+    /// Emit a persistent &lt;filters&gt;&lt;pivotFilter type="count"&gt; block so a
+    /// topN crop survives Excel's Refresh. Without this, ApplyTopNFilter only
+    /// trims source rows pre-cache (or pre-render when cache is shared) and
+    /// Refresh re-pulls all rows from the worksheet source, expanding the
+    /// pivot back to its full set. The schema matches what Excel emits when
+    /// a user manually configures Value Filters → Top 10.
+    /// </summary>
+    internal static void ApplyTopNPivotFilter(
+        PivotTableDefinition pivotDef,
+        Dictionary<string, string> properties,
+        List<int> rowFieldIndices,
+        int valueFieldCount)
+    {
+        if (!properties.TryGetValue("topN", out var topNStr)
+            && !properties.TryGetValue("topn", out topNStr))
+            return;
+        if (!int.TryParse(topNStr, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var topN)
+            || topN <= 0)
+            return;
+        if (rowFieldIndices.Count == 0 || valueFieldCount == 0) return;
+
+        int outerFieldIdx = rowFieldIndices[0];
+
+        // CT_pivotFilter shape verified against Excel-authored sample (user
+        // applied Top 10 filter via UI on cum-17 → saved → diffed):
+        //   <filters count="1">
+        //     <filter fld="<outer>" type="count" evalOrder="-1" id="1" iMeasureFld="0">
+        //       <autoFilter ref="A1">              <!-- placeholder, ignored -->
+        //         <filterColumn colId="0">
+        //           <top10 val="N" filterVal="N"/> <!-- top/percent omit = defaults -->
+        //         </filterColumn>
+        //       </autoFilter>
+        //     </filter>
+        //   </filters>
+        // Notes from the Excel-authored XML:
+        //   - autoFilter ref is "A1" (placeholder), NOT the pivot's real range
+        //   - <top10> omits top= and percent= (defaults: top=true, percent=false)
+        //   - filterVal duplicates val for simple count filters
+        // CRITICAL: pivot must NOT share its cache with sibling pivots — Excel
+        // crashes on any topN attempt against a shared cache (UI-applied or
+        // ours). CreatePivotTable forces own cache when hasTopN is set.
+        var filters = pivotDef.GetFirstChild<PivotFilters>() ?? new PivotFilters();
+        var pivotFilter = new PivotFilter
+        {
+            Field = (uint)outerFieldIdx,
+            Type = PivotFilterValues.Count,
+            EvaluationOrder = -1,
+            Id = 1U,
+            MeasureField = 0
+        };
+        var autoFilter = new AutoFilter { Reference = "A1" };
+        var filterColumn = new FilterColumn { ColumnId = 0U };
+        filterColumn.AppendChild(new Top10
+        {
+            Val = (double)topN,
+            FilterValue = (double)topN
+        });
+        autoFilter.AppendChild(filterColumn);
+        pivotFilter.AppendChild(autoFilter);
+        filters.AppendChild(pivotFilter);
+        if (pivotDef.GetFirstChild<PivotFilters>() == null)
+        {
+            filters.Count = (uint)filters.Elements<PivotFilter>().Count();
+            // Schema order: filters lives after pivotTableStyleInfo, before
+            // rowHierarchiesUsage/colHierarchiesUsage/extLst.
+            var anchor = (OpenXmlElement?)pivotDef.GetFirstChild<RowHierarchiesUsage>()
+                ?? (OpenXmlElement?)pivotDef.GetFirstChild<ColumnHierarchiesUsage>()
+                ?? (OpenXmlElement?)pivotDef.GetFirstChild<PivotTableDefinitionExtensionList>();
+            if (anchor != null)
+                pivotDef.InsertBefore(filters, anchor);
+            else
+                pivotDef.AppendChild(filters);
+        }
+        else
+        {
+            filters.Count = (uint)filters.Elements<PivotFilter>().Count();
+        }
     }
 
     /// <summary>
@@ -1275,9 +1471,12 @@ internal static partial class PivotTableHelper
     //     on the pivotCacheDefinition (formula stored WITHOUT leading '=')
     //   - a <x:pivotField dataField="1"/> on the pivotTableDefinition
     //   - a <x:dataField name="Name" fld="<new cacheFieldIdx>"/>
-    //   - a <x:calculatedFields> marker block on the pivotTableDefinition
-    //     (ECMA-376 §18.10.1.13; OpenXml SDK does not model it, so we emit
-    //     it as an unknown element).
+    //
+    // Do NOT emit a <x:calculatedFields> block on pivotTableDefinition —
+    // that element is NOT a valid child there (ECMA-376 places it only
+    // under pivotCacheDefinition, and Excel rejects the file as schema-
+    // invalid). The cacheField/@formula attribute alone fully expresses
+    // the calculated field; Excel rebuilds the column live on open.
     //
     // No records are written for calculated fields (databaseField="0"),
     // matching the date-group-derived pattern — Excel computes the column
@@ -1310,10 +1509,13 @@ internal static partial class PivotTableHelper
             pivotDef.DataFields = dataFields;
         }
 
-        // Accumulate a single <x:calculatedFields> block — OOXML requires one
-        // container, not one per field.
-        const string xNs = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-        var calcFieldsEl = new OpenXmlUnknownElement("x", "calculatedFields", xNs);
+        // Mirror layout-dependent attributes (compact/outline) from an existing
+        // source pivotField so the calc fields stay attribute-consistent with
+        // the rest of the table. Excel rejects a pivotTable where some
+        // pivotFields declare compact="0" outline="0" but later ones omit them.
+        var templatePf = pivotFields.Elements<PivotField>().FirstOrDefault();
+        bool templateCompactFalse = templatePf?.Compact?.Value == false;
+        bool templateOutlineFalse = templatePf?.Outline?.Value == false;
 
         foreach (var (name, formula) in specs)
         {
@@ -1341,43 +1543,142 @@ internal static partial class PivotTableHelper
             var newFieldIdx = (uint)(cacheFields.Elements<CacheField>().Count() - 1);
             cacheFields.Count = (uint)cacheFields.Elements<CacheField>().Count();
 
-            // 2. pivotField — empty, DataField=true.
+            // 2. pivotField — calculated fields can only live on the Values
+            // axis: dragTo* + defaultSubtotal=0 lock them out of Row/Col/Page
+            // and suppress the implicit subtotal Excel adds to real fields.
+            // Layout attrs mirrored from source pivotFields for consistency.
             var pf = new PivotField
             {
                 DataField = true,
-                ShowAll = false
+                DragToRow = false,
+                DragToColumn = false,
+                DragToPage = false,
+                ShowAll = false,
+                DefaultSubtotal = false
             };
+            if (templateCompactFalse) pf.Compact = false;
+            if (templateOutlineFalse) pf.Outline = false;
             pivotFields.AppendChild(pf);
             pivotFields.Count = (uint)pivotFields.Elements<PivotField>().Count();
 
-            // 3. dataField
+            // 3. dataField — the dataField name MUST differ from the
+            // underlying cacheField name (otherwise Excel detects a collision
+            // on refresh, demotes the calc field out of dataFields, and
+            // renames the cacheField with a "2" suffix). Mirror Excel's
+            // convention of prefixing the aggregation ("Sum of "). Calculated
+            // fields have no user-supplied agg, so default to Sum.
             var df = new DataField
             {
-                Name = name,
+                Name = "Sum of " + name,
                 Field = newFieldIdx,
                 BaseField = 0,
                 BaseItem = 0u
             };
             dataFields.AppendChild(df);
             dataFields.Count = (uint)dataFields.Elements<DataField>().Count();
-
-            // 4. calculatedFields entry
-            var calcField = new OpenXmlUnknownElement("x", "calculatedField", xNs);
-            calcField.SetAttribute(new OpenXmlAttribute("name", "", name));
-            calcField.SetAttribute(new OpenXmlAttribute("formula", "", cleanFormula));
-            calcFieldsEl.AppendChild(calcField);
         }
 
-        // Place <x:calculatedFields> after <x:dataFields> (ECMA-376 schema
-        // order: ...dataFields, formats, conditionalFormats, chartFormats,
-        // pivotHierarchies, pivotTableStyleInfo, filters, rowHierarchiesUsage,
-        // colHierarchiesUsage, extLst). We insert before pivotTableStyle info
-        // if present so the element lands in a schema-legal slot.
-        var insertBefore = (OpenXmlElement?)pivotDef.GetFirstChild<PivotTableStyle>();
-        if (insertBefore != null)
-            pivotDef.InsertBefore(calcFieldsEl, insertBefore);
-        else
-            pivotDef.AppendChild(calcFieldsEl);
+        // Sync the synthetic Values column axis with the new dataField count.
+        // With 2+ dataFields and no explicit cols=, Excel requires:
+        //   <colFields count="1"><field x="-2"/></colFields>
+        //   <colItems count="N"> ... </colItems>   (N = number of dataFields)
+        // The initial build path emits these only if it saw >=2 value fields
+        // at construction time; calculated fields are appended later, so we
+        // patch them here. Without this Excel rejects the file as corrupt.
+        int totalDataFields = dataFields.Elements<DataField>().Count();
+        if (totalDataFields > 1)
+        {
+            // ColumnFields: ensure trailing <field x="-2"/>
+            var colFields = pivotDef.ColumnFields ?? new ColumnFields();
+            bool hasValuesSentinel = colFields.Elements<Field>()
+                .Any(f => f.Index?.Value == -2);
+            if (!hasValuesSentinel)
+            {
+                colFields.AppendChild(new Field { Index = -2 });
+                colFields.Count = (uint)colFields.Elements<Field>().Count();
+                if (pivotDef.ColumnFields == null)
+                {
+                    // Insert in schema-order slot (after RowItems, before ColumnItems).
+                    var anchor = (OpenXmlElement?)pivotDef.ColumnItems
+                        ?? (OpenXmlElement?)pivotDef.PageFields
+                        ?? (OpenXmlElement?)pivotDef.DataFields;
+                    if (anchor != null)
+                        pivotDef.InsertBefore(colFields, anchor);
+                    else
+                        pivotDef.AppendChild(colFields);
+                }
+            }
+
+            // ColumnItems: rebuild as N entries — one <i><x/></i> for the
+            // first data field (default), then <i i="K"><x v="K"/></i> for
+            // each subsequent dataField index K.
+            var newColItems = new ColumnItems();
+            for (int k = 0; k < totalDataFields; k++)
+            {
+                var i = new RowItem();
+                if (k > 0) i.Index = (uint)k;
+                var mx = new MemberPropertyIndex();
+                if (k > 0) mx.Val = k;
+                i.AppendChild(mx);
+                newColItems.AppendChild(i);
+            }
+            newColItems.Count = (uint)totalDataFields;
+            pivotDef.ColumnItems = newColItems;
+        }
+
+        // Extend Location.Reference to cover the new calc-field columns. The
+        // initial RenderPivotIntoSheet writes cells only for user-supplied
+        // value fields (e.g. Sum of Sales at column M); calc fields are NOT
+        // pre-rendered into sheetData. Without extending Location, Excel
+        // treats the pivot as the original L1:M{R} rectangle and the calc
+        // fields appear in the Field List but their columns never display.
+        //
+        // Pair this with refreshOnLoad=1 on the cacheDef (below) so Excel
+        // populates the calc-field cells on open — the formula attribute on
+        // each calc cacheField gives Excel everything it needs.
+        int calcAdded = specs.Count;
+        if (calcAdded > 0 && pivotDef.Location?.Reference?.Value is string locRef)
+        {
+            var parts = locRef.Split(':');
+            if (parts.Length == 2)
+            {
+                var endRef = parts[1];
+                int splitIdx = 0;
+                while (splitIdx < endRef.Length && char.IsLetter(endRef[splitIdx])) splitIdx++;
+                if (splitIdx > 0 && splitIdx < endRef.Length)
+                {
+                    var endCol = endRef.Substring(0, splitIdx);
+                    var endRow = endRef.Substring(splitIdx);
+                    var endColIdx = ColumnLettersToIndex(endCol) + calcAdded;
+                    var newEndCol = ColumnIndexToLetters(endColIdx);
+                    pivotDef.Location.Reference = new StringValue(parts[0] + ":" + newEndCol + endRow);
+                }
+            }
+        }
+
+        // refreshOnLoad=1 tells Excel "recompute this cache when the file
+        // opens." Required for calc fields whose values are not pre-rendered.
+        cacheDef.RefreshOnLoad = true;
+    }
+
+    private static int ColumnLettersToIndex(string letters)
+    {
+        int idx = 0;
+        foreach (var ch in letters.ToUpperInvariant())
+            idx = idx * 26 + (ch - 'A' + 1);
+        return idx;
+    }
+
+    private static string ColumnIndexToLetters(int idx)
+    {
+        var sb = new System.Text.StringBuilder();
+        while (idx > 0)
+        {
+            int rem = (idx - 1) % 26;
+            sb.Insert(0, (char)('A' + rem));
+            idx = (idx - 1) / 26;
+        }
+        return sb.ToString();
     }
 
     /// <summary>

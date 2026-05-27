@@ -655,11 +655,26 @@ public partial class PowerPointHandler
             ?? throw new ArgumentException(
                 $"Invalid placeholder type: '{phTypeStr}'. Valid: title, body, subtitle, date, footer, slidenum, header, picture, chart, table, diagram, media, obj, clipart.");
 
+        // PowerPoint disallows two placeholders with the same phType in a
+        // single slide — UI auto-deduplicates and the file becomes ill-formed
+        // for round-trip. Pre-check spTree before allocating a new <p:sp> so
+        // dump→replay or scripted Add can't silently double up. Set is the
+        // canonical update path; if caller really wants to drop the old slot
+        // first, they should Remove then Add.
+        var existingPh = phShapeTree.Elements<Shape>()
+            .FirstOrDefault(s => s.NonVisualShapeProperties
+                ?.ApplicationNonVisualDrawingProperties
+                ?.GetFirstChild<PlaceholderShape>()?.Type?.Value == phTypeVal);
+        if (existingPh != null)
+            throw new ArgumentException(
+                $"Placeholder phType='{phTypeStr}' already exists on slide {phSlideIdx}. " +
+                "Use Set to update the existing placeholder, or Remove the existing one first.");
+
         var phId = AcquireShapeId(phShapeTree, properties);
         var phName = properties.GetValueOrDefault("name", $"{phTypeStr} Placeholder {phId}");
 
         // ECMA-376 §19.3.1.36: every non-title placeholder needs an @idx so the
-        // slide-layout slot can be located by PowerPoint / LibreOffice. Without
+        // slide-layout slot can be located by PowerPoint. Without
         // idx, the placeholder defaults to idx=0 which collides with title and
         // strips geometry/font inheritance. Strategy:
         //   1. If user passed phIndex explicitly, honor it.
@@ -781,8 +796,8 @@ public partial class PowerPointHandler
         );
         // Leave ShapeProperties empty when layout supplies geometry — but when
         // the slide's layout has no matching <p:ph> slot (e.g. user added a
-        // body placeholder to a Blank-layout slide), PowerPoint and LibreOffice
-        // render NOTHING. Inject a sensible default rectangle so the shape is
+        // body placeholder to a Blank-layout slide), PowerPoint
+        // renders NOTHING. Inject a sensible default rectangle so the shape is
         // at least visible. Coordinates picked to roughly mirror the standard
         // "Title and Content" layout slots (16:9 deck, EMU = 914400/inch).
         shape.ShapeProperties = new ShapeProperties();
@@ -808,7 +823,7 @@ public partial class PowerPointHandler
                 new Drawing.Extents { Cx = geom.cx, Cy = geom.cy }
             ));
             // R24 — do NOT inject <a:prstGeom prst="rect"/> by default. PPT
-            // and LibreOffice both fall back to a rectangle when no geometry
+            // falls back to a rectangle when no geometry
             // is declared on a placeholder's spPr (the placeholder slot is
             // inherently rectangular), so the explicit element is redundant
             // for rendering. The cost of emitting it is real: NodeBuilder

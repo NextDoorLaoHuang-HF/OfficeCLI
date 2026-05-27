@@ -1177,7 +1177,7 @@ public partial class PowerPointHandler
                     node.Format["margin"] = $"{FormatEmu(lIns ?? 91440)},{FormatEmu(tIns ?? 45720)},{FormatEmu(rIns ?? 91440)},{FormatEmu(bIns ?? 45720)}";
             }
 
-            // Vertical alignment — map XML enum to user-friendly name (like POI TextAlign)
+            // Vertical alignment — map XML enum to user-friendly name
             if (bodyPr.Anchor?.HasValue == true)
             {
                 var vaInner = bodyPr.Anchor.InnerText;
@@ -1606,6 +1606,35 @@ public partial class PowerPointHandler
         // descendants, so Get must surface it to close the round-trip.
         if (!string.IsNullOrEmpty(alt)) node.Format["alt"] = alt;
         else node.Format["alt"] = "(missing)";
+
+        // CONSISTENCY(picture-relid): mirror docx (WordHandler.ImageHelpers
+        // emits Format["relId"] on the run-picture) and xlsx. Without this
+        // key, TryExtractBinary refuses to extract the image — `get --save`
+        // would fail on every pptx picture. contentType/fileSize follow the
+        // same pattern as the Query picture branch so Get and Query agree.
+        var embedRel = pic.BlipFill?.Blip?.Embed?.Value;
+        if (!string.IsNullOrEmpty(embedRel))
+        {
+            node.Format["relId"] = embedRel!;
+            if (slidePart != null)
+            {
+                try
+                {
+                    var imgPart = slidePart.GetPartById(embedRel!);
+                    if (imgPart != null)
+                    {
+                        node.Format["contentType"] = imgPart.ContentType;
+                        // Dispose the stream so the underlying ZipArchiveEntry is
+                        // released — otherwise a subsequent DeletePart (e.g. when
+                        // Set replaces a picture's source) throws "Cannot delete an
+                        // entry currently open for writing".
+                        using var s = imgPart.GetStream();
+                        node.Format["fileSize"] = s.Length;
+                    }
+                }
+                catch { /* rel may not resolve on the slide part — leave as relId-only */ }
+            }
+        }
 
         // Read media timing (volume, autoplay) from slide Timing tree
         if ((isVideo || isAudio) && slidePart != null)

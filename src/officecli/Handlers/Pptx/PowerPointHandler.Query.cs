@@ -67,7 +67,7 @@ public partial class PowerPointHandler
             if (props.Description != null) node.Format["description"] = props.Description;
             if (props.Category != null) node.Format["category"] = props.Category;
             if (props.LastModifiedBy != null) node.Format["lastModifiedBy"] = props.LastModifiedBy;
-            if (props.Revision != null) node.Format["revision"] = props.Revision;
+            if (props.Revision != null) node.Format["revisionNumber"] = props.Revision;
             if (props.Created != null) node.Format["created"] = props.Created.Value.ToString("o");
             if (props.Modified != null) node.Format["modified"] = props.Modified.Value.ToString("o");
 
@@ -592,7 +592,7 @@ public partial class PowerPointHandler
                 if (cellFillColor != null) cellNode.Format["fill"] = cellFillColor;
             }
 
-            // Cell borders — following POI's getBorderWidth/getBorderColor pattern
+            // Cell borders
             if (tcPr != null)
                 ReadTableCellBorders(tcPr, cellNode);
 
@@ -735,6 +735,7 @@ public partial class PowerPointHandler
             var shapeTree = GetSlide(phSlidePart).CommonSlideData?.ShapeTree;
             var shapeIdx = shapeTree?.Elements<Shape>().ToList().IndexOf(phShape) ?? 0;
             var node = ShapeToNode(phShape, phSlideIdx, shapeIdx + 1, depth, phSlidePart);
+            RebaseDescendantPaths(node, node.Path, path);
             node.Path = path;
             node.Type = "placeholder";
             if (ph?.Type?.HasValue == true) node.Format["phType"] = ph.Type.InnerText;
@@ -1256,6 +1257,57 @@ public partial class PowerPointHandler
             throw new ArgumentException(
                 $"Invalid selector '{selector}': path-style selectors starting with '/' are not allowed in query. Use the element name (e.g. 'shape', 'slide') or a typed selector (e.g. 'shape[text=Hello]').");
 
+        // CSS comma-list union: split on top-level commas (outside [] and ()),
+        // recurse Query() on each part, dedupe by node identity (Path+Type).
+        // Without this, "chart, table" silently collapsed to just `chart` —
+        // the bare-word type-match loop below only ever sees the first token.
+        if (!string.IsNullOrEmpty(selector) && ContainsTopLevelComma(selector))
+        {
+            var parts = SplitTopLevelCommas(selector);
+            var union = new List<DocumentNode>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var part in parts)
+            {
+                var trimmed = part.Trim();
+                if (trimmed.Length == 0) continue;
+                foreach (var n in Query(trimmed))
+                {
+                    var key = (n.Path ?? "") + "\x00" + (n.Type ?? "");
+                    if (seen.Add(key)) union.Add(n);
+                }
+            }
+            return union;
+        }
+
+        // Unsupported CSS combinators: `+` (adjacent sibling) and `~` (general
+        // sibling) silently degraded to "first-token only" because the parser
+        // never looked past the leading bareword. Detect them at top level
+        // (outside [] / quotes) and reject with a clear pointer — silent
+        // wrong-answers are the worst failure mode for agent scripts.
+        var unsupportedCombinator = FindUnsupportedCombinator(selector);
+        if (unsupportedCombinator != null)
+            throw new CliException(
+                $"Unsupported combinator '{unsupportedCombinator}' in selector '{selector}'. " +
+                $"`+` (adjacent sibling) and `~` (general sibling) are not supported.")
+            {
+                Code = "invalid_selector",
+                Suggestion = "Use a comma list (`chart, table`) for union, or filter on a single element type and post-filter."
+            };
+
+        // Descendant combinator `A B` (whitespace-separated tokens) — only
+        // `slide ...` is supported (ancestor scoping); anything else (e.g.
+        // `chart table`) silently fell through to "match first token" and
+        // returned charts. Reject explicitly.
+        var unsupportedDescendant = FindUnsupportedDescendant(selector);
+        if (unsupportedDescendant != null)
+            throw new CliException(
+                $"Unsupported descendant combinator in selector '{selector}': " +
+                $"only `slide X` ancestor scoping is supported, not `{unsupportedDescendant}`.")
+            {
+                Code = "invalid_selector",
+                Suggestion = "Use a slide-scoped form (`slide chart`) or query the inner element directly."
+            };
+
         var results = new List<DocumentNode>();
         var parsed = ParseShapeSelector(selector);
         bool isEquationSelector = parsed.ElementType is "equation" or "math" or "formula";
@@ -1287,6 +1339,18 @@ public partial class PowerPointHandler
             var unindexedPrefix = Regex.Match(typeSource, @"^\s*slide\s*>\s*", RegexOptions.IgnoreCase);
             if (unindexedPrefix.Success)
                 typeSource = typeSource.Substring(unindexedPrefix.Length);
+            else
+            {
+                // CSS descendant combinator `slide chart` — same subject rule
+                // as `slide > chart`: subject is the right-hand element. The
+                // ParseShapeSelector pass above already handled this for
+                // attribute fan-out; rawType needs the matching strip so the
+                // dispatch table (line ~1342 `if rawType == "slide"`) does
+                // not return the ancestor.
+                var unindexedDescendant = Regex.Match(typeSource, @"^\s*slide\s+(?=\w)", RegexOptions.IgnoreCase);
+                if (unindexedDescendant.Success)
+                    typeSource = typeSource.Substring(unindexedDescendant.Length);
+            }
         }
         var typeMatch = Regex.Match(typeSource, @"^([\w]+)");
         var rawType = typeMatch.Success ? typeMatch.Groups[1].Value.ToLowerInvariant() : "";
@@ -1512,18 +1576,8 @@ public partial class PowerPointHandler
                     if (rawType == "image" && mediaType != "picture") continue;
                     var picNode = PictureToNode(pic, mediaSlideNum, picIdx, slidePart);
                     picNode.Format["mediaType"] = mediaType;
-                    // Add content type from image part
-                    var blipFill = pic.BlipFill;
-                    var blip = blipFill?.Blip;
-                    if (blip?.Embed?.Value != null)
-                    {
-                        var part = slidePart.GetPartById(blip.Embed.Value);
-                        if (part != null)
-                        {
-                            picNode.Format["contentType"] = part.ContentType;
-                            picNode.Format["fileSize"] = part.GetStream().Length;
-                        }
-                    }
+                    // CONSISTENCY(picture-relid): contentType/fileSize now
+                    // emitted inside PictureToNode so Get and Query agree.
                     results.Add(picNode);
                 }
             }

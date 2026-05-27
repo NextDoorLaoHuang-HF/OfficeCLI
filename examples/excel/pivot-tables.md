@@ -3,7 +3,7 @@
 This demo consists of three files that work together:
 
 - **pivot-tables.py** — Python script that calls `officecli` commands to generate the workbook. Each pivot table command is shown as a copyable shell command in the comments, then executed by the script. Read this to learn the exact `officecli add --type pivottable --prop ...` syntax.
-- **pivot-tables.xlsx** — The generated workbook with 13 sheets. Open in Excel to see the rendered pivot tables. Use `officecli get` or `officecli query` to inspect programmatically.
+- **pivot-tables.xlsx** — The generated workbook with 19 sheets (Sheet1 + CNData + 17 pivot tables). Open in Excel to see the rendered pivot tables. Use `officecli get` or `officecli query` to inspect programmatically.
 - **pivot-tables.md** — This file. Maps each sheet in the xlsx to the feature it demonstrates and the command that created it.
 
 ## Regenerate
@@ -234,6 +234,123 @@ officecli add pivot-tables.xlsx "/11-Chinese Locale" --type pivottable \
 ```
 
 **Features:** `sort=locale` (pinyin: 华北 < 华东 < 华南 < 西南), `grandTotalCaption`
+
+### Sheet: 12-Position + Aggregates
+
+Anchors the pivot at cell D2 instead of the auto-placed default. Demonstrates the less-common value aggregations (count, min, product, countNums) and the `aggregate=avg` default used when a value tuple omits its aggregation.
+
+```bash
+officecli add pivot-tables.xlsx "/12-Position + Aggregates" --type pivottable \
+  --prop source=Sheet1!A1:J51 \
+  --prop position=D2 \
+  --prop rows=Category \
+  --prop 'values=Sales:count,Quantity:min,Quantity:product,Sales:countNums' \
+  --prop aggregate=avg \
+  --prop layout=tabular \
+  --prop grandtotals=both \
+  --prop style=PivotStyleLight16
+```
+
+**Features:** `position=D2`, `aggregate=avg` (default agg), value aggs `count` / `min` / `product` / `countNums`
+
+### Sheet: 13-Calculated Field
+
+User-defined formula fields (`Margin = Sales - Cost`, `Tax = Sales * 0.1`) are auto-added as data fields — no need to list them in `values=`. A pre-cache `labelFilter` keeps only rows where Region begins with "N".
+
+```bash
+officecli add pivot-tables.xlsx "/13-Calculated Field" --type pivottable \
+  --prop source=Sheet1!A1:J51 \
+  --prop 'calculatedField1=Margin:=Sales-Cost' \
+  --prop 'calculatedField2=Tax:=Sales*0.1' \
+  --prop rows=Region \
+  --prop values=Sales:sum \
+  --prop 'labelFilter=Region:beginsWith:N' \
+  --prop layout=tabular \
+  --prop grandtotals=both \
+  --prop style=PivotStyleMedium3
+```
+
+**Features:** `calculatedField1` / `calculatedField2`, `labelFilter`
+
+### Sheet: 14-Statistical
+
+Completes the aggregate set with sample/population variance (`var` / `varP`). `showDataAs=running_total` is set as a standalone prop (vs the per-value `Field:agg:mode` tuple) and applies to all value fields as the default display.
+
+```bash
+officecli add pivot-tables.xlsx "/14-Statistical" --type pivottable \
+  --prop source=Sheet1!A1:J51 \
+  --prop rows=Region \
+  --prop cols=Quarter \
+  --prop 'values=Sales:var,Sales:varP,Sales:sum' \
+  --prop showDataAs=running_total \
+  --prop layout=tabular \
+  --prop grandtotals=both \
+  --prop style=PivotStyleLight10
+```
+
+**Features:** `Sales:var`, `Sales:varP`, `showDataAs=running_total` (standalone)
+
+### Sheet: 15-Independent Totals
+
+Row and column grand totals toggled independently (vs the combined `grandtotals=both/rows/cols/none`). `defaultSubtotal=true` sets the default-subtotal flag on every pivotField. `sort=locale-desc` reverses pinyin order.
+
+```bash
+officecli add pivot-tables.xlsx "/15-Independent Totals" --type pivottable \
+  --prop source=CNData!A1:C13 \
+  --prop rows=地区 \
+  --prop cols=品类 \
+  --prop values=销售额:sum \
+  --prop rowGrandTotals=true \
+  --prop colGrandTotals=false \
+  --prop defaultSubtotal=true \
+  --prop layout=outline \
+  --prop subtotals=on \
+  --prop sort=locale-desc \
+  --prop style=PivotStyleMedium11
+```
+
+**Features:** `rowGrandTotals` / `colGrandTotals` (independent), `defaultSubtotal`, `sort=locale-desc`
+
+### Sheet: 16-Style Flags
+
+All five `pivotTableStyleInfo` flags wired up — row/col banding, row/col header emphasis, last-column highlight. These map directly to the checkboxes in Excel's PivotTable Styles ribbon.
+
+```bash
+officecli add pivot-tables.xlsx "/16-Style Flags" --type pivottable \
+  --prop source=Sheet1!A1:J51 \
+  --prop rows=Region,Category \
+  --prop cols=Quarter \
+  --prop values=Sales:sum \
+  --prop showRowStripes=true \
+  --prop showColStripes=true \
+  --prop showRowHeaders=true \
+  --prop showColHeaders=true \
+  --prop showLastColumn=true \
+  --prop layout=tabular \
+  --prop grandtotals=both \
+  --prop style=PivotStyleMedium17
+```
+
+**Features:** `showRowStripes`, `showColStripes`, `showRowHeaders`, `showColHeaders`, `showLastColumn`
+
+### Sheet: 17-Display Toggles
+
+`showDrill=false` hides the +/- expand-collapse buttons on every field. `mergeLabels=true` merges and centers repeated outer-axis item cells (`<pivotTableDefinition mergeItem="1">`).
+
+```bash
+officecli add pivot-tables.xlsx "/17-Display Toggles" --type pivottable \
+  --prop source=Sheet1!A1:J51 \
+  --prop rows=Region,Category \
+  --prop values=Sales:sum \
+  --prop showDrill=false \
+  --prop mergeLabels=true \
+  --prop layout=outline \
+  --prop grandtotals=both \
+  --prop subtotals=on \
+  --prop style=PivotStyleLight19
+```
+
+**Features:** `showDrill=false`, `mergeLabels=true`
 
 ## Inspect the Generated File
 

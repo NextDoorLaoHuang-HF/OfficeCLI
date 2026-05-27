@@ -2035,27 +2035,27 @@ internal class WatchServer : IDisposable
 
     /// <summary>
     /// Handle POST /api/revision/accept — accept all tracked changes.
-    /// Spawns officecli set with acceptallchanges=all, waits for completion,
+    /// Spawns officecli set with revision.action=accept, waits for completion,
     /// then signals SSE clients with a "full" refresh.
     /// </summary>
     private async Task HandleRevisionAcceptAsync(NetworkStream stream, Dictionary<string, string> headers, string bodyPrefix, CancellationToken token)
     {
-        await RunRevisionActionAsync(stream, "acceptallchanges=all", token);
+        await RunRevisionActionAsync(stream, "revision.action=accept", token);
     }
 
     /// <summary>
     /// Handle POST /api/revision/reject — reject all tracked changes.
-    /// Spawns officecli set with rejectallchanges=all, waits for completion,
+    /// Spawns officecli set with revision.action=reject, waits for completion,
     /// then signals SSE clients with a "full" refresh.
     /// </summary>
     private async Task HandleRevisionRejectAsync(NetworkStream stream, Dictionary<string, string> headers, string bodyPrefix, CancellationToken token)
     {
-        await RunRevisionActionAsync(stream, "rejectallchanges=all", token);
+        await RunRevisionActionAsync(stream, "revision.action=reject", token);
     }
 
     /// <summary>
     /// Common helper for revision accept/reject actions.
-    /// Spawns officecli set with the given prop, returns 204 on success.
+    /// Spawns "officecli set <file> /revision --prop revision.action=..." returns 204 on success.
     /// After the command completes, sends a "full" SSE event to trigger
     /// a page refresh on all connected browsers.
     /// </summary>
@@ -2077,50 +2077,13 @@ internal class WatchServer : IDisposable
             };
             psi.ArgumentList.Add("set");
             psi.ArgumentList.Add(_filePath);
-            psi.ArgumentList.Add("/");
+            psi.ArgumentList.Add("/revision");
             psi.ArgumentList.Add("--prop");
             psi.ArgumentList.Add(propArg);
             using var proc = System.Diagnostics.Process.Start(psi);
             if (proc != null)
             {
                 await proc.WaitForExitAsync(token);
-
-                // After the set command completes, re-render the HTML so the
-                // cached snapshot stays in sync. Without this, wordDiffUpdate
-                // fetches stale HTML via fetch('/') and the diff reverts the
-                // change visually.
-                try
-                {
-                    var viewPsi = new System.Diagnostics.ProcessStartInfo
-                    {
-                        FileName = exe,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        UseShellExecute = false,
-                        CreateNoWindow = true
-                    };
-                    viewPsi.ArgumentList.Add("view");
-                    viewPsi.ArgumentList.Add(_filePath);
-                    viewPsi.ArgumentList.Add("html");
-                    using var viewProc = System.Diagnostics.Process.Start(viewPsi);
-                    if (viewProc != null)
-                    {
-                        var htmlPath = (await viewProc.StandardOutput.ReadLineAsync(token) ?? "").Trim();
-                        await viewProc.WaitForExitAsync(token);
-                        if (!string.IsNullOrEmpty(htmlPath) && File.Exists(htmlPath))
-                        {
-                            var freshHtml = await File.ReadAllTextAsync(htmlPath, token);
-                            if (!string.IsNullOrEmpty(freshHtml))
-                                _currentHtml = freshHtml;
-                        }
-                    }
-                }
-                catch
-                {
-                    // Non-fatal: if re-render fails, SSE clients still get
-                    // the "full" event and will fall back to location.reload().
-                }
-
                 // After the set command completes, notify SSE clients to refresh
                 _version++;
                 SendSseEvent("full", 0, null, null, _version);
@@ -2165,6 +2128,7 @@ internal class WatchServer : IDisposable
             {
                 var output = await proc.StandardOutput.ReadToEndAsync(token);
                 await proc.WaitForExitAsync(token);
+                proc.Close();
                 // "officecli query <file> revision" outputs one line per revision.
                 // Count non-empty lines to get the revision count.
                 if (string.IsNullOrWhiteSpace(output))

@@ -95,7 +95,7 @@
     },
     "showDataAs": {
       "type": "string",
-      "description": "value-field display mode: normal, percentOfTotal, percentOfRow, percentOfCol, percentOfParent, runningTotal, rankAscending, rankDescending, index, difference, percentDifference.",
+      "description": "value-field display mode: normal, percentOfTotal, percentOfRow, percentOfCol, runningTotal. (percentOfParent / rankAscending / rankDescending / index / difference / percentDifference are not yet supported.)",
       "aliases": ["showdataas"],
       "add": true, "set": true, "get": false,
       "examples": ["--prop showDataAs=percentOfTotal"],

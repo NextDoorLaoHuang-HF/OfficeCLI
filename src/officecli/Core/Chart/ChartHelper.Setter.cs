@@ -1203,8 +1203,11 @@ internal static partial class ChartHelper
                         // barChart elements that have no GapWidth child. The `foreach
                         // Descendants` above then finds nothing and the gapwidth round-
                         // trips as lost. Mirror the `overlap` upsert pattern.
-                        foreach (var barChartEl in plotArea2.Elements<OpenXmlCompositeElement>()
-                            .Where(e => e.LocalName == "barChart" || e.LocalName == "bar3DChart"))
+                        var barEls = plotArea2.Elements<OpenXmlCompositeElement>()
+                            .Where(e => e.LocalName == "barChart" || e.LocalName == "bar3DChart")
+                            .ToList();
+                        if (barEls.Count == 0) { unsupported.Add(key); break; }
+                        foreach (var barChartEl in barEls)
                         {
                             // Insert before the first AxisId — mirrors BuildBarChart's
                             // schema order: [barDirection, barGrouping, varyColors,
@@ -1225,7 +1228,11 @@ internal static partial class ChartHelper
                     if (plotArea2 == null) { unsupported.Add(key); break; }
                     if (!int.TryParse(value, out var ov)) throw new ArgumentException($"Invalid overlap: '{value}'. Expected integer (-100 to 100).");
                     if (ov < -100 || ov > 100) throw new ArgumentException($"Invalid overlap: '{value}'. Valid range is -100 to 100.");
-                    foreach (var barChart in plotArea2.Elements<OpenXmlCompositeElement>().Where(e => e.LocalName.Contains("barChart") || e.LocalName.Contains("BarChart")))
+                    var overlapBarEls = plotArea2.Elements<OpenXmlCompositeElement>()
+                        .Where(e => e.LocalName.Contains("barChart") || e.LocalName.Contains("BarChart"))
+                        .ToList();
+                    if (overlapBarEls.Count == 0) { unsupported.Add(key); break; }
+                    foreach (var barChart in overlapBarEls)
                     {
                         var overlapEl = barChart.GetFirstChild<C.Overlap>();
                         if (overlapEl != null) overlapEl.Val = (sbyte)ov;
@@ -1447,8 +1454,13 @@ internal static partial class ChartHelper
                     var plotArea2 = chart.GetFirstChild<C.PlotArea>();
                     var valAx = plotArea2?.GetFirstChild<C.ValueAxis>();
                     if (valAx == null) { unsupported.Add(key); break; }
+                    // Remove only same-type predecessors. The pre-fix code also
+                    // removed C.CrossesAt here, which silently wiped a sibling
+                    // crossesAt value when both keys arrived in the same Set
+                    // call (e.g. crosses + crossesAt + crossBetween together):
+                    // the second branch reset both children and the first
+                    // branch's write disappeared.
                     valAx.RemoveAllChildren<C.Crosses>();
-                    valAx.RemoveAllChildren<C.CrossesAt>();
                     var crossVal = value.ToLowerInvariant() switch
                     {
                         "max" => C.CrossesValues.Maximum,
@@ -1456,12 +1468,12 @@ internal static partial class ChartHelper
                         _ => C.CrossesValues.AutoZero
                     };
                     // CONSISTENCY(chart/crosses-schema-order): CT_ValAx requires
-                    // crossAx → crosses → crossBetween. BuildValueAxis emits
-                    // CrossBetween last; AppendChild here would land after it and
-                    // PowerPoint silently rejects the file. Insert before CrossBetween.
+                    // crossAx → crosses → crossesAt → crossBetween. Insert
+                    // before whichever later sibling exists.
                     var newCrosses = new C.Crosses { Val = crossVal };
-                    var cbBefore = valAx.GetFirstChild<C.CrossBetween>();
-                    if (cbBefore != null) valAx.InsertBefore(newCrosses, cbBefore);
+                    var crossesAnchor = valAx.GetFirstChild<C.CrossesAt>() as OpenXmlElement
+                        ?? valAx.GetFirstChild<C.CrossBetween>() as OpenXmlElement;
+                    if (crossesAnchor != null) valAx.InsertBefore(newCrosses, crossesAnchor);
                     else valAx.AppendChild(newCrosses);
                     break;
                 }
@@ -1471,12 +1483,14 @@ internal static partial class ChartHelper
                     var plotArea2 = chart.GetFirstChild<C.PlotArea>();
                     var valAx = plotArea2?.GetFirstChild<C.ValueAxis>();
                     if (valAx == null) { unsupported.Add(key); break; }
-                    valAx.RemoveAllChildren<C.Crosses>();
+                    // Same-type only — see comment on the crosses branch above.
                     valAx.RemoveAllChildren<C.CrossesAt>();
-                    // CONSISTENCY(chart/crosses-schema-order): same as crosses above.
                     var newCrossesAt = new C.CrossesAt { Val = ParseHelpers.SafeParseDouble(value, "crossesAt") };
-                    var cbBefore2 = valAx.GetFirstChild<C.CrossBetween>();
-                    if (cbBefore2 != null) valAx.InsertBefore(newCrossesAt, cbBefore2);
+                    // CONSISTENCY(chart/crosses-schema-order): crossesAt sits
+                    // between crosses and crossBetween. Insert before
+                    // crossBetween if present; otherwise append.
+                    var crossAtAnchor = valAx.GetFirstChild<C.CrossBetween>();
+                    if (crossAtAnchor != null) valAx.InsertBefore(newCrossesAt, crossAtAnchor);
                     else valAx.AppendChild(newCrossesAt);
                     break;
                 }
@@ -2874,17 +2888,49 @@ internal static partial class ChartHelper
 
     private static C.TextProperties BuildLabelTextProperties(string spec)
     {
+        // Format: size[:color[:bold-or-fontname[:fontname]]]
+        // The 3rd slot accepts either a bool ("true"/"false") for bold OR a
+        // typeface name (e.g. "Arial"). Earlier this slot was bool-only,
+        // which silently dropped fontname inputs like
+        // `labelFont=14:#FF0000:Arial`. Reader emits the fontname via
+        // `labelFont.name` (dotted subkey), so the round-trip path now also
+        // matches `BuildDefaultRunPropertiesFromCompoundSpec` (axisFont/
+        // legendFont) — compound 3rd slot = fontname unless it parses as a
+        // bool. A 4th slot is honored as the explicit fontname when the
+        // 3rd is the bold flag.
         var parts = spec.Split(':');
-        var fontSize = parts.Length > 0 && int.TryParse(parts[0], out var fs) ? fs * 100 : 1000;
+        var sizeStr = parts.Length > 0
+            ? (parts[0].EndsWith("pt", StringComparison.OrdinalIgnoreCase) ? parts[0][..^2] : parts[0])
+            : "";
+        var fontSize = sizeStr.Length > 0 && double.TryParse(sizeStr,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var fs)
+            ? (int)System.Math.Round(fs * 100) : 1000;
         var color = parts.Length > 1 ? parts[1] : null;
-        var bold = parts.Length > 2 && parts[2].Equals("true", StringComparison.OrdinalIgnoreCase);
 
-        var defRp = new Drawing.DefaultRunProperties { FontSize = fontSize, Bold = bold };
+        bool bold = false;
+        string? fontName = null;
+        if (parts.Length > 2 && !string.IsNullOrEmpty(parts[2]))
+        {
+            if (parts[2].Equals("true", StringComparison.OrdinalIgnoreCase)) bold = true;
+            else if (parts[2].Equals("false", StringComparison.OrdinalIgnoreCase)) bold = false;
+            else fontName = parts[2];
+        }
+        if (parts.Length > 3 && !string.IsNullOrEmpty(parts[3]))
+            fontName = parts[3];
+
+        var defRp = new Drawing.DefaultRunProperties { FontSize = fontSize };
+        if (bold) defRp.Bold = true;
         if (!string.IsNullOrEmpty(color))
         {
             var solidFill = new Drawing.SolidFill();
             solidFill.AppendChild(BuildChartColorElement(color));
             defRp.AppendChild(solidFill);
+        }
+        if (!string.IsNullOrEmpty(fontName))
+        {
+            defRp.AppendChild(new Drawing.LatinFont { Typeface = fontName });
+            defRp.AppendChild(new Drawing.EastAsianFont { Typeface = fontName });
         }
 
         return new C.TextProperties(
@@ -3045,14 +3091,20 @@ internal static partial class ChartHelper
         // (sysDashDot / lgDashDot / lgDashDotDot / sysDashDotDot) — the
         // Reader emits the camelCase form to mirror the schema spelling,
         // so dump→replay would otherwise hit the `_ => Solid` fallback.
+        //
+        // Friendly aliases (dash / dot / dashDot / longDash) all map to the
+        // sys*/lg* variants per schemas/help/_shared/chart-series.json lineDash:
+        // "Set accepts user-friendly aliases; Get returns OOXML token
+        // (sysDash/sysDot/sysDashDot/lgDash). 'solid' is the only round-trip-
+        // stable value." The literal Dash/Dot/DashDot enum members are
+        // obscure variants Excel rarely emits — friendly callers expect the
+        // sys* result, not the literal one.
         return dash.ToLowerInvariant() switch
         {
             "solid" => Drawing.PresetLineDashValues.Solid,
-            "dot" => Drawing.PresetLineDashValues.Dot,
-            "sysdot" => Drawing.PresetLineDashValues.SystemDot,
-            "dash" => Drawing.PresetLineDashValues.Dash,
-            "sysdash" => Drawing.PresetLineDashValues.SystemDash,
-            "dashdot" => Drawing.PresetLineDashValues.DashDot,
+            "dot" or "sysdot" => Drawing.PresetLineDashValues.SystemDot,
+            "dash" or "sysdash" => Drawing.PresetLineDashValues.SystemDash,
+            "dashdot" or "sysdashdot" or "sysdash_dot" => Drawing.PresetLineDashValues.SystemDashDot,
             // dashDotDot has no native CT_PresetLineDashValues enum member —
             // ECMA-376 (DrawingML) defines only dash/dashDot plus the sys*/lg*
             // dot-dot variants. Tolerate the natural extrapolation as an
@@ -3062,7 +3114,6 @@ internal static partial class ChartHelper
             // shape/connector lineDash so users know Get readback will be
             // sysDashDotDot, not dashDotDot.
             "dashdotdot" => Drawing.PresetLineDashValues.SystemDashDotDot,
-            "sysdashdot" or "sysdash_dot" => Drawing.PresetLineDashValues.SystemDashDot,
             "sysdashdotdot" or "sysdash_dot_dot" => Drawing.PresetLineDashValues.SystemDashDotDot,
             "longdash" or "lgdash" => Drawing.PresetLineDashValues.LargeDash,
             "longdashdot" or "lgdashdot" => Drawing.PresetLineDashValues.LargeDashDot,

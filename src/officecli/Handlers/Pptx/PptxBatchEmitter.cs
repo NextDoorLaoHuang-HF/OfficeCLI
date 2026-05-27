@@ -140,6 +140,13 @@ public static partial class PptxBatchEmitter
         if (ctx.DeferredLinks.Count > 0)
             items.AddRange(ctx.DeferredLinks);
 
+        // Best-effort passthrough for presentation-level structural children
+        // that the typed emit path doesn't model — custShowLst, extLst
+        // (sectionLst / modifyVerifier / …). Runs LAST so the raw-set append
+        // lands after `add slide` has populated sldIdLst. References by rId
+        // may go stale on replay; UnsupportedWarning surfaces that risk.
+        EmitPresentationExtras(ppt, items, ctx);
+
         return (items, ctx.Unsupported);
     }
 
@@ -541,10 +548,20 @@ public static partial class PptxBatchEmitter
         // Append into /p:sld preserves OOXML schema order because we removed
         // the corresponding props upstream: the slide carries neither
         // <p:transition> nor <p:timing> at this point in replay.
+        // R42-B1: append slide-level children that the semantic emit path
+        // doesn't write. Order follows OOXML schema (cSld → clrMapOvr →
+        // transition → timing → extLst). Since the freshly-added slide
+        // carries none of these (semantic emit covered only cSld and the
+        // optional <p:transition> via prop), an "append on /p:sld" sequence
+        // in schema order produces a schema-valid result.
+        if (exotic.ClrMapOvrXml != null)
+            EmitRawSlideSlice(slidePath, "p:clrMapOvr", exotic.ClrMapOvrXml, items, ctx);
         if (exotic.HasExoticTransition && exotic.TransitionXml != null)
             EmitRawSlideSlice(slidePath, "p:transition", exotic.TransitionXml, items, ctx);
         if (exotic.HasExoticTiming && exotic.TimingXml != null)
             EmitRawSlideSlice(slidePath, "p:timing", exotic.TimingXml, items, ctx);
+        if (exotic.ExtLstXml != null)
+            EmitRawSlideSlice(slidePath, "p:extLst", exotic.ExtLstXml, items, ctx);
 
         // SmartArt graphicFrames live in /p:sld/p:cSld/p:spTree but are
         // skipped by NodeBuilder (table/chart-only routing). Phase 3b emits
@@ -644,7 +661,18 @@ public static partial class PptxBatchEmitter
     /// </summary>
     private readonly record struct SlideExoticContent(
         bool HasExoticTransition, string? TransitionXml,
-        bool HasExoticTiming, string? TimingXml);
+        bool HasExoticTiming, string? TimingXml,
+        // R42-B1: two sld-level children that the semantic emit path never
+        // reads. Both round-trip via raw-set append on /p:sld, mirroring
+        // the transition/timing passthrough. Schema order under <p:sld>
+        // is cSld → clrMapOvr → transition → timing → extLst, so appending
+        // these in scan order (clrMapOvr before, extLst after) preserves
+        // ordering relative to the raw-emitted transition/timing slices.
+        // Plain (non-exotic) <p:timing> is owned by the animation index
+        // path; we deliberately do NOT raw-emit it here to avoid
+        // duplicating effects with the semantic add-animation rows.
+        string? ClrMapOvrXml,
+        string? ExtLstXml);
 
     private static SlideExoticContent ScanSlideExoticContent(PowerPointHandler ppt, string slidePath)
     {
@@ -736,8 +764,26 @@ public static partial class PptxBatchEmitter
                 // PopulateAnimationNode — flagging those would force every
                 // emphasis slide through raw-set and break the basic
                 // animation round-trip.
+                // R10-bug2: media-only timing (`<p:audio>/<p:video>` carrying
+                // <p:cMediaNode vol=… repeatCount=…> + the play-cmd seq under
+                // <p:tnLst>) holds the only copy of volume / loop / autoPlay /
+                // trim props for audio/video shapes. BuildSlideAnimationIndex
+                // does not materialise those nodes (they're not shape entrance
+                // /exit/emphasis presets), so without exotic-flagging the
+                // entire <p:timing> slice the semantic emit drops every audio
+                // /video playback prop. Route through the same raw-set
+                // passthrough used for motion-path animations. Same caveat:
+                // a slide carrying both materialised animations AND a media
+                // timing block will double-emit the animation portion — rare
+                // in practice (audio/video decks seldom also carry shape
+                // entrance effects), and the alternative (surgically slicing
+                // <p:audio>/<p:video> out of the timing tree and stitching
+                // around BuildSlideAnimationIndex output) is materially more
+                // work than the warning-vs-correctness tradeoff justifies.
                 if (slice.Contains("presetClass=\"path\"", StringComparison.Ordinal)
-                    || slice.Contains("<p:animMotion", StringComparison.Ordinal))
+                    || slice.Contains("<p:animMotion", StringComparison.Ordinal)
+                    || slice.Contains("<p:audio", StringComparison.Ordinal)
+                    || slice.Contains("<p:video", StringComparison.Ordinal))
                 {
                     timingExotic = true;
                     timingXml = slice;
@@ -745,7 +791,57 @@ public static partial class PptxBatchEmitter
             }
         }
 
-        return new SlideExoticContent(transExotic, transXml, timingExotic, timingXml);
+        // R42-B1: scan for <p:clrMapOvr> with a child <p:masterClrMapping/> or
+        // <p:overrideClrMapping ...>. The empty <p:clrMapOvr><p:masterClrMapping/>
+        // form is the default and conveys no information beyond "use master"
+        // (PowerPoint silently inserts it on every slide), so we still emit it
+        // to keep dump→replay byte-faithful. Captured by literal substring
+        // match — clrMapOvr never carries namespace-extension content.
+        string? clrMapOvrXml = null;
+        var cmIdx = xml.IndexOf("<p:clrMapOvr", StringComparison.Ordinal);
+        if (cmIdx >= 0)
+        {
+            var sliceEnd = SliceEnd(xml, cmIdx, "p:clrMapOvr");
+            if (sliceEnd > cmIdx)
+                clrMapOvrXml = xml.Substring(cmIdx, sliceEnd - cmIdx);
+        }
+
+        // R42-B1: scan for <p:extLst> directly under <p:sld>. Slide-level
+        // extLst typically carries section IDs, slide-id markers, and other
+        // extension content the semantic path doesn't model. We capture the
+        // last <p:extLst>...</p:extLst> in the doc because shapes inside
+        // spTree may also carry their own extLst — those round-trip via the
+        // shape passthrough. Slide-level extLst always appears AFTER timing,
+        // so the right anchor is the last occurrence not nested in a shape.
+        // Heuristic: scan for </p:timing> or </p:cSld> and take any extLst
+        // appearing AFTER all of those, before </p:sld>.
+        string? extLstXml = null;
+        var sldEnd = xml.LastIndexOf("</p:sld>", StringComparison.Ordinal);
+        if (sldEnd > 0)
+        {
+            // Find the last <p:extLst that begins after the spTree close.
+            var spTreeEnd = xml.LastIndexOf("</p:spTree>", sldEnd, StringComparison.Ordinal);
+            var anchor = spTreeEnd > 0 ? spTreeEnd : xml.IndexOf("</p:cSld>", StringComparison.Ordinal);
+            if (anchor > 0)
+            {
+                var eIdx = xml.IndexOf("<p:extLst", anchor, StringComparison.Ordinal);
+                while (eIdx > 0 && eIdx < sldEnd)
+                {
+                    var eEnd = SliceEnd(xml, eIdx, "p:extLst");
+                    if (eEnd > eIdx && eEnd <= sldEnd)
+                    {
+                        extLstXml = xml.Substring(eIdx, eEnd - eIdx);
+                        // Only one slide-level extLst is legal per schema;
+                        // stop at the first match past the spTree close.
+                        break;
+                    }
+                    eIdx = xml.IndexOf("<p:extLst", eIdx + 1, StringComparison.Ordinal);
+                }
+            }
+        }
+
+        return new SlideExoticContent(transExotic, transXml, timingExotic, timingXml,
+            clrMapOvrXml, extLstXml);
     }
 
     // Normalize a slide raw slice into a stable textual form so the first-pass
@@ -763,6 +859,17 @@ public static partial class PptxBatchEmitter
         if (string.IsNullOrEmpty(sliceXml) || !sliceXml.StartsWith("<")) return sliceXml;
         try
         {
+            // The slice is extracted as a raw substring of /p:sld and inherits
+            // its ambient namespace bindings from the slide root — so the
+            // standalone slice text may use prefixes (mc, p, a, r) that aren't
+            // declared on its own root. XDocument.Parse would then throw an
+            // unbound-prefix error and the whole normalize step would silently
+            // bail (catch below), leaving slice bytes drifting between rounds.
+            // Inject the ambient decls onto the slice root tag so parsing
+            // succeeds. The later "drop ambient from root tag" pass strips
+            // them again post-serialize, so the emitted slice still travels
+            // without redundant decls.
+            sliceXml = EnsureAmbientXmlnsOnRootTag(sliceXml);
             var doc = System.Xml.Linq.XDocument.Parse(sliceXml);
             if (doc.Root == null) return sliceXml;
             var ambient = new (string Prefix, System.Xml.Linq.XNamespace Ns)[]
@@ -796,6 +903,86 @@ public static partial class PptxBatchEmitter
                 // Stamp the canonical prefix decl onto the root.
                 doc.Root.SetAttributeValue(System.Xml.Linq.XNamespace.Xmlns + prefix, ns.NamespaceName);
             }
+            // Lift extension prefix declarations (p14, p15, p159, am3d, …) up
+            // to the slice root if any descendant binds them and the root does
+            // not already declare them. The SDK normalizes namespace decls to
+            // the highest needed ancestor on serialize, so a slice that
+            // declares xmlns:p14 on <p:transition> on pass 1 round-trips
+            // through the SDK and comes back with xmlns:p14 on
+            // <mc:AlternateContent> on pass 2 — same semantics, different
+            // bytes. Mirror that transform here so pass-1 and pass-2 slices
+            // are byte-equal. Only lift prefixes that are NOT already in the
+            // ambient set (those were handled above) and only the FIRST
+            // binding seen for each prefix (per-prefix singleton — extensions
+            // never use multiple URIs in one slice).
+            var ambientPrefixes = new HashSet<string>(StringComparer.Ordinal) { "p", "a", "r", "mc" };
+            var liftedPrefixes = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var desc in doc.Root.DescendantsAndSelf())
+            {
+                var nsDecls = desc.Attributes()
+                    .Where(a => a.IsNamespaceDeclaration && !ambientPrefixes.Contains(a.Name.LocalName))
+                    .ToList();
+                foreach (var a in nsDecls)
+                {
+                    var prefix = a.Name.LocalName;
+                    if (!liftedPrefixes.ContainsKey(prefix))
+                        liftedPrefixes[prefix] = a.Value;
+                }
+            }
+            foreach (var (prefix, uri) in liftedPrefixes)
+            {
+                if (doc.Root.GetNamespaceOfPrefix(prefix) != null) continue;
+                doc.Root.SetAttributeValue(System.Xml.Linq.XNamespace.Xmlns + prefix, uri);
+            }
+            // R42-T2: drop unused non-ambient xmlns decls from the slice root.
+            //
+            // Pass 1 extracts a transition AlternateContent slice that declares
+            // ONLY xmlns:p159 because that's what its <mc:Choice> references.
+            // After replay, the SDK serializes the slide such that the SAME
+            // AlternateContent picks up sibling decls (xmlns:am3d, xmlns:a16,
+            // ...) from the slide root, because the SDK propagates every
+            // root-level namespace down to top-level children when it can't
+            // prove they are unused. Pass 2 then extracts a slice carrying
+            // xmlns:am3d that pass 1 did not — same semantics, drifting bytes.
+            //
+            // A non-ambient prefix is "used" by this slice iff it appears on an
+            // element name, an attribute name, OR as a token inside
+            // mc:Choice/@Requires or any @mc:Ignorable. Anything else is dead
+            // weight inherited from the parent and should be stripped to keep
+            // the slice byte-stable across rounds.
+            var mcNs = System.Xml.Linq.XNamespace.Get("http://schemas.openxmlformats.org/markup-compatibility/2006");
+            var usedPrefixes = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var el in doc.Root.DescendantsAndSelf())
+            {
+                if (!string.IsNullOrEmpty(el.Name.NamespaceName))
+                {
+                    var p = el.GetPrefixOfNamespace(el.Name.Namespace);
+                    if (!string.IsNullOrEmpty(p)) usedPrefixes.Add(p);
+                }
+                foreach (var attr in el.Attributes())
+                {
+                    if (attr.IsNamespaceDeclaration) continue;
+                    if (!string.IsNullOrEmpty(attr.Name.NamespaceName))
+                    {
+                        var p = el.GetPrefixOfNamespace(attr.Name.Namespace);
+                        if (!string.IsNullOrEmpty(p)) usedPrefixes.Add(p);
+                    }
+                    // mc:Choice/@Requires + mc:Ignorable are space-separated
+                    // prefix lists referencing namespaces by their bound name.
+                    if (attr.Name == mcNs + "Ignorable" || attr.Name.LocalName == "Requires"
+                        || attr.Name.LocalName == "Ignorable")
+                    {
+                        foreach (var tok in attr.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                            usedPrefixes.Add(tok);
+                    }
+                }
+            }
+            var stripDecls = doc.Root.Attributes()
+                .Where(a => a.IsNamespaceDeclaration
+                            && !ambientPrefixes.Contains(a.Name.LocalName)
+                            && !usedPrefixes.Contains(a.Name.LocalName))
+                .ToList();
+            foreach (var d in stripDecls) d.Remove();
             // Drop redundant prefix decls on descendants that match the root's
             // (mirrors CanonicalizeRawXml but on the post-rewrite tree).
             var rootDecls = doc.Root.Attributes()
@@ -824,6 +1011,46 @@ public static partial class PptxBatchEmitter
             return StripAmbientXmlnsFromRootTag(serialized);
         }
         catch { return sliceXml; }
+    }
+
+    private static string EnsureAmbientXmlnsOnRootTag(string xml)
+    {
+        if (string.IsNullOrEmpty(xml) || xml[0] != '<') return xml;
+        var gtIdx = xml.IndexOf('>');
+        if (gtIdx <= 0) return xml;
+        var head = xml[..gtIdx];
+        var tail = xml[gtIdx..];
+        // For each ambient prefix that appears anywhere in the slice text but
+        // is NOT already declared on the root tag, inject the canonical
+        // xmlns:<prefix>="<uri>" pair. Pattern match keeps the helper text-
+        // only so we don't need a parse for the parse precondition.
+        var ambientUris = new (string Prefix, string Uri)[]
+        {
+            ("p",  "http://schemas.openxmlformats.org/presentationml/2006/main"),
+            ("a",  "http://schemas.openxmlformats.org/drawingml/2006/main"),
+            ("r",  "http://schemas.openxmlformats.org/officeDocument/2006/relationships"),
+            ("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006"),
+        };
+        foreach (var (prefix, uri) in ambientUris)
+        {
+            // Already declared somewhere in the head? Look for xmlns:<prefix>=.
+            if (head.Contains($"xmlns:{prefix}=\"", StringComparison.Ordinal)) continue;
+            // Used by an element or attribute name in the slice?
+            if (!xml.Contains($"<{prefix}:", StringComparison.Ordinal)
+                && !xml.Contains($" {prefix}:", StringComparison.Ordinal)) continue;
+            // Inject xmlns:<prefix>="<uri>" inside the root tag, before the '>'.
+            // Be defensive: head might be self-closing ("<tag/>"); place
+            // declaration before the trailing /  if present.
+            if (head.EndsWith('/'))
+            {
+                head = head[..^1] + $" xmlns:{prefix}=\"{uri}\"" + "/";
+            }
+            else
+            {
+                head = head + $" xmlns:{prefix}=\"{uri}\"";
+            }
+        }
+        return head + tail;
     }
 
     private static string StripAmbientXmlnsFromRootTag(string xml)
@@ -935,6 +1162,10 @@ public static partial class PptxBatchEmitter
         {
             // add-part smartart with pinned rIds. Props carry the source's
             // rIds; replay's AddPart calls AddNewPart<T>(rId) for each.
+            // `skip-frame=true` suppresses add-part's stub graphicFrame
+            // injection — the raw-set append below carries the source's
+            // full graphicFrame (with real position/size/name/cNvPr id), so
+            // letting add-part also inject a stub would produce a duplicate.
             items.Add(new BatchItem
             {
                 Command = "add-part",
@@ -946,6 +1177,7 @@ public static partial class PptxBatchEmitter
                     ["layout"] = sa.LayoutRelId,
                     ["colors"] = sa.ColorsRelId,
                     ["quickStyle"] = sa.QuickStyleRelId,
+                    ["skip-frame"] = "true",
                 },
             });
 

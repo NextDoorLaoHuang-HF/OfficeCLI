@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pivot Table Showcase — generates pivot-tables.xlsx with 11 pivot tables.
+Pivot Table Showcase — generates pivot-tables.xlsx with 17 pivot tables.
 
 Each pivot table demonstrates different officecli features.
 See pivot-tables.md for a guide to each sheet in the generated file.
@@ -114,7 +114,7 @@ for i, (r, c, s) in enumerate([
 cli(f'batch "{FILE}" --force --commands \'{json.dumps(data_cmds)}\'')
 
 # ==========================================================================
-# 11 Pivot Tables
+# 17 Pivot Tables
 #
 # Each section below shows the exact officecli command in a comment block,
 # then executes it. You can copy any command block and run it in a terminal.
@@ -473,5 +473,210 @@ cli(f'add "{FILE}" "/11-Chinese Locale" --type pivottable'
     f' --prop name=ChineseLocale'
     f' --prop style=PivotStyleMedium2')
 
+# --------------------------------------------------------------------------
+# Sheet: 12-Position + Aggregates
+#
+# officecli add pivot-tables.xlsx "/12-Position + Aggregates" --type pivottable \
+#   --prop source=Sheet1!A1:J51 \
+#   --prop position=D2 \
+#   --prop rows=Category \
+#   --prop 'values=Sales:count,Quantity:min,Quantity:product,Sales:countNums' \
+#   --prop aggregate=avg \
+#   --prop layout=tabular \
+#   --prop grandtotals=both \
+#   --prop name=PositionAggs \
+#   --prop style=PivotStyleLight16
+#
+# Features: position=D2 (anchor cell override, default is auto-place after source),
+#   aggregate=avg (default agg when omitted from a value tuple),
+#   value aggregations: count, min, product, countNums (sum/avg/max shown elsewhere)
+# --------------------------------------------------------------------------
+print("\n--- 12-Position + Aggregates ---")
+cli(f'add "{FILE}" / --type sheet --prop name="12-Position + Aggregates"')
+cli(f'add "{FILE}" "/12-Position + Aggregates" --type pivottable'
+    f' --prop source=Sheet1!A1:J51'
+    f' --prop position=D2'
+    f' --prop rows=Category'
+    f' --prop values=Sales:count,Quantity:min,Quantity:product,Sales:countNums'
+    f' --prop aggregate=avg'
+    f' --prop layout=tabular'
+    f' --prop grandtotals=both'
+    f' --prop name=PositionAggs'
+    f' --prop style=PivotStyleLight16')
+
+# --------------------------------------------------------------------------
+# Sheet: 13-Calculated Field
+#
+# officecli add pivot-tables.xlsx "/13-Calculated Field" --type pivottable \
+#   --prop source=Sheet1!A1:J51 \
+#   --prop 'calculatedField1=Margin:=Sales-Cost' \
+#   --prop 'calculatedField2=Tax:=Sales*0.1' \
+#   --prop rows=Region \
+#   --prop values=Sales:sum \
+#   --prop 'labelFilter=Region:beginsWith:N' \
+#   --prop layout=tabular \
+#   --prop grandtotals=both \
+#   --prop name=CalcField \
+#   --prop style=PivotStyleMedium3
+#
+# Features: calculatedField1/2 — user-defined formula fields auto-added as
+#   data fields (no need to mention in values=). labelFilter — pre-cache row
+#   filter ('Region:beginsWith:N' keeps only Region values starting with N).
+# --------------------------------------------------------------------------
+print("\n--- 13-Calculated Field ---")
+cli(f'add "{FILE}" / --type sheet --prop name="13-Calculated Field"')
+cli(f'add "{FILE}" "/13-Calculated Field" --type pivottable'
+    f' --prop source=Sheet1!A1:J51'
+    f' --prop calculatedField1=Margin:=Sales-Cost'
+    f' --prop calculatedField2=Tax:=Sales*0.1'
+    f' --prop rows=Region'
+    f' --prop values=Sales:sum'
+    f' --prop labelFilter=Region:beginsWith:N'
+    f' --prop layout=tabular'
+    f' --prop grandtotals=both'
+    f' --prop name=CalcField'
+    f' --prop style=PivotStyleMedium3')
+
+# --------------------------------------------------------------------------
+# Sheet: 14-Statistical
+#
+# officecli add pivot-tables.xlsx "/14-Statistical" --type pivottable \
+#   --prop source=Sheet1!A1:J51 \
+#   --prop rows=Region \
+#   --prop cols=Quarter \
+#   --prop 'values=Sales:var,Sales:varP,Sales:sum' \
+#   --prop showDataAs=running_total \
+#   --prop layout=tabular \
+#   --prop grandtotals=both \
+#   --prop name=Statistical \
+#   --prop style=PivotStyleLight10
+#
+# Features: var / varP (sample + population variance) — completes the aggregate
+#   set. showDataAs=running_total as a standalone --prop (vs the tuple form
+#   'Field:agg:mode'); applies as default display for all value fields.
+# --------------------------------------------------------------------------
+print("\n--- 14-Statistical ---")
+cli(f'add "{FILE}" / --type sheet --prop name="14-Statistical"')
+cli(f'add "{FILE}" "/14-Statistical" --type pivottable'
+    f' --prop source=Sheet1!A1:J51'
+    f' --prop rows=Region'
+    f' --prop cols=Quarter'
+    f' --prop values=Sales:var,Sales:varP,Sales:sum'
+    f' --prop showDataAs=running_total'
+    f' --prop layout=tabular'
+    f' --prop grandtotals=both'
+    f' --prop name=Statistical'
+    f' --prop style=PivotStyleLight10')
+
+# --------------------------------------------------------------------------
+# Sheet: 15-Independent Totals
+#
+# officecli add pivot-tables.xlsx "/15-Independent Totals" --type pivottable \
+#   --prop source=CNData!A1:C13 \
+#   --prop rows=地区 \
+#   --prop cols=品类 \
+#   --prop values=销售额:sum \
+#   --prop rowGrandTotals=true \
+#   --prop colGrandTotals=false \
+#   --prop defaultSubtotal=true \
+#   --prop layout=outline \
+#   --prop subtotals=on \
+#   --prop sort=locale-desc \
+#   --prop name=IndepTotals \
+#   --prop style=PivotStyleMedium11
+#
+# Features: rowGrandTotals + colGrandTotals as independent toggles
+#   (vs the combined grandtotals=both/rows/cols/none), defaultSubtotal=true
+#   (default-subtotal flag on every pivotField), sort=locale-desc (reverse
+#   pinyin: 西南 > 华南 > 华东 > 华北).
+# --------------------------------------------------------------------------
+print("\n--- 15-Independent Totals ---")
+cli(f'add "{FILE}" / --type sheet --prop name="15-Independent Totals"')
+cli(f'add "{FILE}" "/15-Independent Totals" --type pivottable'
+    f' --prop source=CNData!A1:C13'
+    f' --prop rows=地区'
+    f' --prop cols=品类'
+    f' --prop values=销售额:sum'
+    f' --prop rowGrandTotals=true'
+    f' --prop colGrandTotals=false'
+    f' --prop defaultSubtotal=true'
+    f' --prop layout=outline'
+    f' --prop subtotals=on'
+    f' --prop sort=locale-desc'
+    f' --prop name=IndepTotals'
+    f' --prop style=PivotStyleMedium11')
+
+# --------------------------------------------------------------------------
+# Sheet: 16-Style Flags
+#
+# officecli add pivot-tables.xlsx "/16-Style Flags" --type pivottable \
+#   --prop source=Sheet1!A1:J51 \
+#   --prop rows=Region,Category \
+#   --prop cols=Quarter \
+#   --prop values=Sales:sum \
+#   --prop showRowStripes=true \
+#   --prop showColStripes=true \
+#   --prop showRowHeaders=true \
+#   --prop showColHeaders=true \
+#   --prop showLastColumn=true \
+#   --prop layout=tabular \
+#   --prop grandtotals=both \
+#   --prop name=StyleFlags \
+#   --prop style=PivotStyleMedium17
+#
+# Features: every pivotTableStyleInfo flag wired up — row/col banding,
+#   row/col header emphasis, last-column highlight. These map to the five
+#   checkboxes in Excel's PivotTable Styles ribbon.
+# --------------------------------------------------------------------------
+print("\n--- 16-Style Flags ---")
+cli(f'add "{FILE}" / --type sheet --prop name="16-Style Flags"')
+cli(f'add "{FILE}" "/16-Style Flags" --type pivottable'
+    f' --prop source=Sheet1!A1:J51'
+    f' --prop rows=Region,Category'
+    f' --prop cols=Quarter'
+    f' --prop values=Sales:sum'
+    f' --prop showRowStripes=true'
+    f' --prop showColStripes=true'
+    f' --prop showRowHeaders=true'
+    f' --prop showColHeaders=true'
+    f' --prop showLastColumn=true'
+    f' --prop layout=tabular'
+    f' --prop grandtotals=both'
+    f' --prop name=StyleFlags'
+    f' --prop style=PivotStyleMedium17')
+
+# --------------------------------------------------------------------------
+# Sheet: 17-Display Toggles
+#
+# officecli add pivot-tables.xlsx "/17-Display Toggles" --type pivottable \
+#   --prop source=Sheet1!A1:J51 \
+#   --prop rows=Region,Category \
+#   --prop values=Sales:sum \
+#   --prop showDrill=false \
+#   --prop mergeLabels=true \
+#   --prop layout=outline \
+#   --prop grandtotals=both \
+#   --prop subtotals=on \
+#   --prop name=DisplayToggles \
+#   --prop style=PivotStyleLight19
+#
+# Features: showDrill=false (hide +/- expand-collapse buttons on every field),
+#   mergeLabels=true (merge & center repeated outer-axis item cells —
+#   <pivotTableDefinition mergeItem='1'>).
+# --------------------------------------------------------------------------
+print("\n--- 17-Display Toggles ---")
+cli(f'add "{FILE}" / --type sheet --prop name="17-Display Toggles"')
+cli(f'add "{FILE}" "/17-Display Toggles" --type pivottable'
+    f' --prop source=Sheet1!A1:J51'
+    f' --prop rows=Region,Category'
+    f' --prop values=Sales:sum'
+    f' --prop showDrill=false'
+    f' --prop mergeLabels=true'
+    f' --prop layout=outline'
+    f' --prop grandtotals=both'
+    f' --prop subtotals=on'
+    f' --prop name=DisplayToggles'
+    f' --prop style=PivotStyleLight19')
+
 print(f"\nDone! Generated: {FILE}")
-print("  13 sheets (Sheet1 + CNData + 11 pivot tables)")
+print("  19 sheets (Sheet1 + CNData + 17 pivot tables)")

@@ -362,7 +362,7 @@ internal static partial class PivotTableHelper
     /// </summary>
     private static readonly HashSet<string> _validSortModes = new(StringComparer.OrdinalIgnoreCase)
     {
-        "asc", "desc", "locale", "locale-desc"
+        "asc", "desc", "locale", "locale-desc", "none"
     };
 
     private static IDisposable PushAxisSortMode(Dictionary<string, string> properties)
@@ -796,23 +796,42 @@ internal static partial class PivotTableHelper
         }
     }
 
-    // PV7 / DEFERRED(xlsx/pivot-advanced-props): row-level pre-cache label
-    // filter. Colon-separated scalar form: `labelFilter=field:type:value`
+    // PV7: row-level label filter. Colon-separated scalar form:
+    //   `labelFilter=field:type:value`
     // where `type` is one of contains, beginsWith, endsWith, equals,
-    // notEquals, doesNotContain. Filtering happens BEFORE the cache is
-    // built so the cache, rendered cells, and totals all stay consistent
-    // (same trick the topN filter uses — the alternative, emitting
-    // <x:filters> in the pivotField, would require the cache and the
-    // filter predicate to agree at runtime and Excel is strict about it).
-    // Known limitation vs native Excel: only row-axis labels are filterable
-    // (column-axis labels are not yet addressable).
-    private static void ApplyLabelFilter(
-        string[] headers,
-        List<string[]> columnData,
-        Dictionary<string, string> properties)
+    // notEquals, doesNotContain.
+    //
+    // V1 behavior: pre-cache row deletion — only filtered rows reached cache,
+    // render, and totals. Refresh-fragile: Excel re-pulls full source range
+    // on Refresh and the filter "disappears" because nothing persistent
+    // captured the predicate.
+    //
+    // V2 behavior (current): split into parse + apply.
+    //   - ParseLabelFilterSpec just decodes the spec into a struct
+    //     (no mutation of columnData).
+    //   - The struct is consumed by:
+    //       * BuildLabelPivotFilter (emit <filter type="captionBeginsWith"/>
+    //         in pivotTable.xml so Refresh keeps it),
+    //       * Render path (skip non-matching rows when writing cells), and
+    //       * Cache: force own cache (Excel crashes on filter ops against
+    //         a shared cache, same as topN/calc/date).
+    //   - Cache is built from the FULL source, so Refresh has all data to
+    //     re-filter against.
+    internal readonly struct LabelFilterSpec
+    {
+        public readonly int FieldIdx;
+        public readonly string OpType;          // canonical: contains, beginsWith, endsWith, equals, notEquals, doesNotContain
+        public readonly string Needle;
+        public readonly Func<string, bool> Match;
+        public LabelFilterSpec(int fieldIdx, string opType, string needle, Func<string, bool> match)
+        { FieldIdx = fieldIdx; OpType = opType; Needle = needle; Match = match; }
+    }
+
+    private static LabelFilterSpec? ParseLabelFilterSpec(
+        string[] headers, Dictionary<string, string> properties)
     {
         if (!properties.TryGetValue("labelFilter", out var spec) || string.IsNullOrEmpty(spec))
-            return;
+            return null;
         var parts = spec.Split(':', 3);
         if (parts.Length != 3)
             throw new ArgumentException(
@@ -824,10 +843,6 @@ internal static partial class PivotTableHelper
         int fieldIdx = Array.FindIndex(headers, h => string.Equals(h, fieldName, StringComparison.Ordinal));
         if (fieldIdx < 0)
             throw new ArgumentException($"labelFilter field '{fieldName}' not found in source headers");
-        if (columnData.Count == 0 || fieldIdx >= columnData.Count) return;
-        var col = columnData[fieldIdx];
-        var rowCount = col.Length;
-        if (rowCount == 0) return;
 
         Func<string, bool> match = opType switch
         {
@@ -840,12 +855,28 @@ internal static partial class PivotTableHelper
             _ => throw new ArgumentException(
                 $"labelFilter type must be one of contains/doesNotContain/beginsWith/endsWith/equals/notEquals, got: '{opType}'"),
         };
+        return new LabelFilterSpec(fieldIdx, opType, needle, match);
+    }
+
+    /// <summary>
+    /// Apply a parsed labelFilter spec to columnData in place (drop
+    /// non-matching rows). Used by the render path's data shaping when
+    /// labelFilter is set, but NOT before cache build — cache must contain
+    /// the full source so Excel's Refresh keeps the filter working.
+    /// </summary>
+    private static void ApplyLabelFilterInPlace(
+        List<string[]> columnData, LabelFilterSpec spec)
+    {
+        if (columnData.Count == 0 || spec.FieldIdx >= columnData.Count) return;
+        var col = columnData[spec.FieldIdx];
+        int rowCount = col.Length;
+        if (rowCount == 0) return;
 
         var keep = new bool[rowCount];
         int keepCount = 0;
         for (int r = 0; r < rowCount; r++)
         {
-            if (match(col[r])) { keep[r] = true; keepCount++; }
+            if (spec.Match(col[r])) { keep[r] = true; keepCount++; }
         }
         if (keepCount == rowCount) return;
         for (int c = 0; c < columnData.Count; c++)
@@ -1007,9 +1038,16 @@ internal static partial class PivotTableHelper
             }
         }
 
-        // 2a. Apply label filter (row-level, pre-cache). Mirrors topN's
-        // filter-before-cache approach so definition/cache stay consistent.
-        ApplyLabelFilter(headers, columnData, properties);
+        // 2a. Parse labelFilter spec (does NOT mutate columnData). The spec
+        // is consumed later in three places:
+        //   * BuildLabelPivotFilter — writes <filter type="captionBeginsWith"/>
+        //     so Refresh keeps it,
+        //   * ApplyLabelFilterInPlace — applied to a render-only copy of
+        //     columnData (filtered rows only),
+        //   * Cache is built from the FULL columnData below.
+        // Cache stays unfiltered so Excel can re-evaluate the filter against
+        // the full source on every Refresh.
+        var labelFilterSpec = ParseLabelFilterSpec(headers, properties);
 
         // 2b. Apply Top-N filter to the source rows (ranked by the first value
         // field's aggregate on the outermost row field). Runs BEFORE cache
@@ -1038,7 +1076,31 @@ internal static partial class PivotTableHelper
         // propagates across siblings, file size doesn't blow up. See
         // CountCacheReferrers / FindMatchingCachePart in
         // PivotTableHelper.Cache.cs for the supporting helpers.
-        var sharedExistingCache = FindMatchingCachePart(workbookPart, sourceSheetName, sourceRef);
+        // Date-grouped pivots add derived cacheFields (year/quarter/month/...)
+        // with <fieldGroup> XML. Calculated-field pivots append synthetic
+        // cacheFields with formula= attributes. Both mutate the cache schema
+        // in ways the sibling pivots don't expect — pivotFields.count on
+        // siblings stays at the original column count while cacheFields.count
+        // grows, and Excel rejects the workbook on that mismatch.
+        // Force a fresh cache when this pivot has either, so its schema
+        // doesn't pollute the shared one. (Sharing remains in effect for
+        // plain-source pivots.)
+        bool hasCalcField = properties.Keys.Any(k =>
+            System.Text.RegularExpressions.Regex.IsMatch(k,
+                @"^calculatedField\d*$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+            || k.Equals("calculatedFields", System.StringComparison.OrdinalIgnoreCase));
+        // topN also requires own cache: when the cache is shared with sibling
+        // pivots, Excel crashes on any topN attempt (UI-applied or our
+        // pivotFilter XML) because the filter would have to apply to a cache
+        // serving multiple pivots with different filter shapes.
+        bool hasTopN = (properties.ContainsKey("topN") || properties.ContainsKey("topn"));
+        // labelFilter: same reasoning as topN — the pivot's <filter> element
+        // applies to a cache; a shared cache would have to honor multiple
+        // sibling pivots' independent filter shapes, which Excel can't.
+        bool hasLabelFilter = labelFilterSpec.HasValue;
+        var sharedExistingCache = (dateGroups.Count > 0 || hasCalcField || hasTopN || hasLabelFilter)
+            ? null
+            : FindMatchingCachePart(workbookPart, sourceSheetName, sourceRef);
         if (sharedExistingCache != null)
         {
             var existingCacheId = GetCacheIdForPart(workbookPart, sharedExistingCache);
@@ -1116,15 +1178,19 @@ internal static partial class PivotTableHelper
         {
             // Cache sharing: skip building the cacheDefinition, the cache
             // records part, and the workbook-level <pivotCache> entry — they
-            // already exist and serve at least one other pivot. We still need
-            // the (fieldNumeric, fieldValueIndex) maps locally so the
-            // RenderPivotIntoSheet step below has the same per-field metadata
-            // a fresh cache build would have produced. Re-derive them with a
-            // throwaway BuildCacheDefinition; its result is discarded.
-            var (_, fn, fvi) =
-                BuildCacheDefinition(sourceSheetName, sourceRef, headers, columnData, axisFieldSet, dateGroups, columnNumFmtIds);
-            fieldNumeric = fn;
-            fieldValueIndex = fvi;
+            // already exist and serve at least one other pivot.
+            //
+            // fieldValueIndex MUST reflect the ACTUAL shared cache's
+            // sharedItems order — not a throwaway re-derivation, which would
+            // sort under THIS pivot's sort mode and produce indices that
+            // disagree with the cache built under the FIRST pivot's sort
+            // mode. Symptom (sheet 16 of cum-17): pivotField.items would
+            // point at the wrong cache positions, so the row labels Excel
+            // displays disagree with the pre-rendered cells.
+            //
+            // Read fieldValueIndex straight from the existing cacheFields.
+            (fieldNumeric, fieldValueIndex) = ReadFieldValueIndexFromCache(
+                cachePart.PivotCacheDefinition, headers);
         }
         else
         {
@@ -1138,7 +1204,7 @@ internal static partial class PivotTableHelper
             // 4b. Create PivotTableCacheRecordsPart and write one record per source row.
             // Without records, Excel rejects the file with "PivotTable report is invalid"
             // because saveData defaults to true. Writing real records also makes the file
-            // self-contained for non-refreshing consumers (POI, third-party parsers).
+            // self-contained for non-refreshing third-party parsers.
             var recordsPart = cachePart.AddNewPart<PivotTableCacheRecordsPart>();
             // Derived date-group fields (databaseField="0") must be excluded from
             // pivotCacheRecords — Excel computes them from the base field's
@@ -1229,9 +1295,18 @@ internal static partial class PivotTableHelper
                 position = $"{posCol}{minBodyRow}";
         }
 
+        // labelFilter row-filtering: NOW that cache + records are built from
+        // the full source, drop non-matching rows from columnData so
+        // BuildPivotTableDefinition and RenderPivotIntoSheet only see the
+        // filtered subset. Cache stays full so Excel's Refresh can
+        // re-evaluate the <filter> XML emitted further below.
+        if (labelFilterSpec.HasValue)
+            ApplyLabelFilterInPlace(columnData, labelFilterSpec.Value);
+
         var pivotDef = BuildPivotTableDefinition(
             pivotName, cacheId, position, headers, columnData,
-            rowFields, colFields, filterFields, valueFields, style, columnNumFmtIds, dateGroups);
+            rowFields, colFields, filterFields, valueFields, style, columnNumFmtIds, dateGroups,
+            fieldValueIndex);
         // Overlay user-supplied <pivotTableStyleInfo> bool attributes
         // (showRowStripes, showColStripes, showRowHeaders, showColHeaders,
         // showLastColumn) onto the style info element BuildPivotTableDefinition
@@ -1258,13 +1333,34 @@ internal static partial class PivotTableHelper
         }
         // PV7: calculatedField — parses `calculatedField="Name:=Formula"` (or
         // numbered variants `calculatedField1=...`, `calculatedField2=...`)
-        // and appends the matching cacheField / pivotField / dataField trio
-        // plus an <x:calculatedFields> marker on the pivotTableDefinition.
+        // and appends the matching cacheField / pivotField / dataField trio.
         // The underlying column is NOT rendered into sheetData; Excel
         // computes calculated fields live at display time from the formula
         // stored on the cacheField.
         if (cachePart.PivotCacheDefinition != null)
             ApplyCalculatedFields(cachePart.PivotCacheDefinition, pivotDef, properties);
+
+        // Persist topN as a <filters><filter type="count"> so Excel's Refresh
+        // re-applies the crop. ApplyTopNFilter (above) already trims source
+        // rows / rendered cells; the filter element is the durable contract
+        // Excel needs after recomputing from cache. XML shape verified against
+        // an Excel-authored sample. CRITICAL: hasTopN must force own cache
+        // (above) — Excel crashes on topN filters against a shared cache.
+        ApplyTopNPivotFilter(pivotDef, properties, rowFields, valueFields.Count);
+
+        // Persist labelFilter as a <filters><filter type="captionBeginsWith">
+        // (or other label-type) block so Refresh re-evaluates against the
+        // full cache. ApplyLabelFilterInPlace above already trimmed
+        // columnData for the render path; this XML is what Excel uses on
+        // every subsequent refresh.
+        if (labelFilterSpec.HasValue)
+        {
+            ApplyLabelPivotFilter(
+                pivotDef,
+                labelFilterSpec.Value.FieldIdx,
+                labelFilterSpec.Value.OpType,
+                labelFilterSpec.Value.Needle);
+        }
 
         pivotPart.PivotTableDefinition = pivotDef;
         pivotPart.PivotTableDefinition.Save();
@@ -1280,8 +1376,8 @@ internal static partial class PivotTableHelper
         // every aggregated cell is a literal <c><v>200</v></c> element.
         //
         // Without this step the pivot opens as an empty drop-down skeleton — the
-        // structure is valid but there is nothing to display. POI / Open XML SDK
-        // suffer from exactly the same limitation; this is the lift that turns
+        // structure is valid but there is nothing to display. Open XML SDK
+        // suffers from exactly the same limitation; this is the lift that turns
         // officecli into a real pivot writer rather than a definition-only one.
         //
         // For unsupported configurations (multiple row/col fields, multiple data
@@ -1693,9 +1789,13 @@ internal static partial class PivotTableHelper
             if (colFieldIndices.Count > 0)
                 headerRows = dataFieldCount > 1 ? 3 : 2;
             else
-                // No col fields: renderer always writes 2 header rows (caption + col-label),
-                // plus an extra data-field name row when there are multiple value fields.
-                headerRows = dataFieldCount > 1 ? 3 : 2;
+                // No col fields, K=1: original 2 header rows (top blank +
+                // header). No col fields, K>1: 2 header rows
+                // (dataCaption + field name row) — previously 3, which
+                // over-claimed by 1 and left an empty styled trailing row.
+                // K>1 was the wrong default; K=1 stays at 2 (matches
+                // Remove path expectations and 50+ existing baselines).
+                headerRows = dataFieldCount > 1 ? 2 : 2;
         }
 
         // Grand-totals toggles:

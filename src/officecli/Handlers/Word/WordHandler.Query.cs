@@ -126,6 +126,19 @@ public partial class WordHandler
             return allOles[wOleIdx - 1];
         }
 
+        // Handle /revision[N] and /revision[@id=X] (or other filter forms)
+        // before ParsePath. Revision markers don't live at a single
+        // document-tree position (they're scattered across runs, paragraph
+        // properties, *PrChange wrappers, etc.) so generic NavigateToElement
+        // can't reach them — route through the shared EnumerateRevisions
+        // enumerator that `query revision` and `set /revision[...]` use,
+        // guaranteeing query→get→set round-trip on the same Path.
+        if (path.StartsWith("/revision[", StringComparison.Ordinal))
+        {
+            var revNode = TryGetRevisionNode(path);
+            if (revNode != null) return revNode;
+        }
+
         // Handle /watermark path
         if (path.Equals("/watermark", StringComparison.OrdinalIgnoreCase))
         {
@@ -615,6 +628,11 @@ public partial class WordHandler
                 styleNode.Format["basedOn.path"] = $"/styles/{style.BasedOn.Val.Value}";
             }
             if (style.NextParagraphStyle?.Val?.Value != null) styleNode.Format["next"] = style.NextParagraphStyle.Val.Value;
+            // <w:link w:val="…"/> — paragraph-style ↔ character-style pair
+            // (Word's "Linked Styles" feature). Without readback, dump emits
+            // `add style id=X type=paragraph` and replay loses the pairing;
+            // the corresponding character style lingers orphaned.
+            if (style.LinkedStyle?.Val?.Value != null) styleNode.Format["linked"] = style.LinkedStyle.Val.Value;
             // BUG-DUMP11-05: top-level Style children — autoRedefine (Word
             // updates the style definition when the user reformats a
             // paragraph using it) and StyleHidden (style hidden from UI
@@ -802,7 +820,7 @@ public partial class WordHandler
                 {
                     styleNode.Format["numId"] = numProps.NumberingId.Val.Value.ToString();
                     if (numProps.NumberingLevelReference?.Val?.Value != null)
-                        styleNode.Format["numLevel"] = numProps.NumberingLevelReference.Val.Value.ToString();
+                        styleNode.Format["ilvl"] = numProps.NumberingLevelReference.Val.Value.ToString();
                 }
 
                 // CONSISTENCY(tabs): tabs[] not yet exposed by paragraph Get.
@@ -854,6 +872,18 @@ public partial class WordHandler
     private DocumentNode BuildSectionNode(SectionProperties sectPr, string path)
     {
         var secNode = new DocumentNode { Path = path, Type = "section" };
+
+        // sectPrChange: `set section + trackChange.author` snapshots prior
+        // sectPr. Surfaced under sectPrChange.* for round-trip; the section
+        // emit path emits a follow-up `set` with trackChange.author/date.
+        var sectPrChange = sectPr.GetFirstChild<SectionPropertiesChange>();
+        if (sectPrChange != null)
+        {
+            if (!string.IsNullOrEmpty(sectPrChange.Author?.Value))
+                secNode.Format["sectPrChange.author"] = sectPrChange.Author!.Value!;
+            if (sectPrChange.Date?.Value is DateTime sDate)
+                secNode.Format["sectPrChange.date"] = sDate.ToString("o");
+        }
 
         var sectType = sectPr.GetFirstChild<SectionType>();
         if (sectType?.Val?.Value != null)
@@ -1790,8 +1820,7 @@ public partial class WordHandler
                 or "toc" or "tableofcontents"
                 or "style" or "styles"
                 or "watermark"
-                or "revision" or "change" or "trackchange"
-                or "trackedchange" or "trackedchanges"
+                or "revision"
                 or "media"
                 or "hyperlink"
                 or "section"
@@ -2096,87 +2125,27 @@ public partial class WordHandler
             return results;
         }
 
-        // Handle revision / track changes query
+        // Handle revision / track changes query. Iteration delegates to the
+        // shared EnumerateRevisions enumerator in WordHandler.Set.Revision.cs
+        // — same enumerator powers `set /revision[N]` accept/reject — so
+        // index addressing on Query and Set agree by construction (no risk
+        // of the query result's `/revision[3]` pointing at a different
+        // marker than `set /revision[3] --prop revision=accept`).
         bool isRevisionSelector = parsed.ChildSelector == null &&
-            (parsed.Element is "revision" or "change" or "trackchange"
-                or "trackedchange" or "trackedchanges");
+            (parsed.Element is "revision");
         if (isRevisionSelector)
         {
+            var allRevs = EnumerateRevisions();
+            var sharedIds = ComputeSharedRevisionIds(allRevs);
             int revIdx = 0;
-            // w:ins (InsertedRun)
-            foreach (var ins in body.Descendants<InsertedRun>())
+            foreach (var rev in allRevs)
             {
                 revIdx++;
-                var text = string.Join("", ins.Descendants<Text>().Select(t => t.Text));
-                if (parsed.ContainsText != null && !text.Contains(parsed.ContainsText, StringComparison.OrdinalIgnoreCase))
+                var text = ExtractRevisionText(rev);
+                if (parsed.ContainsText != null
+                    && !text.Contains(parsed.ContainsText, StringComparison.OrdinalIgnoreCase))
                 { revIdx--; continue; }
-                var node = new DocumentNode
-                {
-                    Path = $"/revision[{revIdx}]",
-                    Type = "revision",
-                    Text = text
-                };
-                node.Format["revisionType"] = "insertion";
-                if (ins.Author?.Value != null) node.Format["author"] = ins.Author.Value;
-                if (ins.Date?.Value != null) node.Format["date"] = ins.Date.Value.ToString("o");
-                results.Add(node);
-            }
-            // w:del (DeletedRun)
-            foreach (var del in body.Descendants<DeletedRun>())
-            {
-                revIdx++;
-                var text = string.Join("", del.Descendants<DeletedText>().Select(t => t.Text));
-                if (parsed.ContainsText != null && !text.Contains(parsed.ContainsText, StringComparison.OrdinalIgnoreCase))
-                { revIdx--; continue; }
-                var node = new DocumentNode
-                {
-                    Path = $"/revision[{revIdx}]",
-                    Type = "revision",
-                    Text = text
-                };
-                node.Format["revisionType"] = "deletion";
-                if (del.Author?.Value != null) node.Format["author"] = del.Author.Value;
-                if (del.Date?.Value != null) node.Format["date"] = del.Date.Value.ToString("o");
-                results.Add(node);
-            }
-            // w:rPrChange (RunPropertiesChange)
-            foreach (var rPrChange in body.Descendants<RunPropertiesChange>())
-            {
-                revIdx++;
-                // Get text from parent run
-                var parentRun = rPrChange.Ancestors<Run>().FirstOrDefault();
-                var text = parentRun != null ? string.Join("", parentRun.Descendants<Text>().Select(t => t.Text)) : "";
-                if (parsed.ContainsText != null && !text.Contains(parsed.ContainsText, StringComparison.OrdinalIgnoreCase))
-                { revIdx--; continue; }
-                var node = new DocumentNode
-                {
-                    Path = $"/revision[{revIdx}]",
-                    Type = "revision",
-                    Text = text
-                };
-                node.Format["revisionType"] = "formatChange";
-                if (rPrChange.Author?.Value != null) node.Format["author"] = rPrChange.Author.Value;
-                if (rPrChange.Date?.Value != null) node.Format["date"] = rPrChange.Date.Value.ToString("o");
-                results.Add(node);
-            }
-            // w:pPrChange (ParagraphPropertiesChange)
-            foreach (var pPrChange in body.Descendants<ParagraphPropertiesChange>())
-            {
-                revIdx++;
-                var parentPara = pPrChange.Ancestors<Paragraph>().FirstOrDefault();
-                var text = parentPara != null ? string.Join("", parentPara.Descendants<Text>().Select(t => t.Text)) : "";
-                if (parsed.ContainsText != null && !text.Contains(parsed.ContainsText, StringComparison.OrdinalIgnoreCase))
-                { revIdx--; continue; }
-                var node = new DocumentNode
-                {
-                    Path = $"/revision[{revIdx}]",
-                    Type = "revision",
-                    Text = text
-                };
-                node.Format["revisionType"] = "paragraphChange";
-                if (pPrChange.Author?.Value != null) node.Format["author"] = pPrChange.Author.Value;
-                if (pPrChange.Date?.Value != null) node.Format["date"] = pPrChange.Date.Value.ToString("o");
-                results.Add(node);
+                results.Add(BuildRevisionNode(rev, revIdx, text, sharedIds));
             }
             return results;
         }

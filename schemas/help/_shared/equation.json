@@ -15,7 +15,7 @@
       "examples": [
         "--prop formula=\"x^2 + y^2 = z^2\""
       ],
-      "readback": "n/a (formula source surfaces in DocumentNode.Text, not Format[])",
+      "readback": "n/a in the shared base. pptx overrides to get:true (LaTeX reconstructed from <m:oMath>); docx does not surface a formula key on Get.",
       "enforcement": "report"
     }
   }

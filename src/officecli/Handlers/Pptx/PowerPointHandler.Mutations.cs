@@ -13,8 +13,10 @@ namespace OfficeCli.Handlers;
 
 public partial class PowerPointHandler
 {
-    public string? Remove(string path)
+    public string? Remove(string path, Dictionary<string, string>? properties = null)
     {
+        // Phase 4: trackChange.* is Word-only. Silently ignored here for now;
+        // PowerPoint has no revision-tracking schema equivalent.
         Modified = true;
         // CONSISTENCY(null-path-guard): callers that pass null get an
         // ArgumentNullException instead of a confusing downstream NRE.
@@ -420,7 +422,7 @@ public partial class PowerPointHandler
         {
             var shapes = container.Elements<Shape>().ToList();
             if (elementIdx < 1 || elementIdx > shapes.Count)
-                throw new ArgumentException($"Shape {elementIdx} not found");
+                throw new ArgumentException($"Shape {elementIdx} not found (total: {shapes.Count})");
             var shapeToRemove = shapes[elementIdx - 1];
             var shapeId = shapeToRemove.NonVisualShapeProperties?.NonVisualDrawingProperties?.Id?.Value ?? 0;
             if (shapeId > 0)
@@ -452,7 +454,7 @@ public partial class PowerPointHandler
             var tables = container.Elements<GraphicFrame>()
                 .Where(gf => gf.Descendants<Drawing.Table>().Any()).ToList();
             if (elementIdx < 1 || elementIdx > tables.Count)
-                throw new ArgumentException($"Table {elementIdx} not found");
+                throw new ArgumentException($"Table {elementIdx} not found (total: {tables.Count})");
             tables[elementIdx - 1].Remove();
         }
         else if (elementType == "chart")
@@ -460,7 +462,7 @@ public partial class PowerPointHandler
             var charts = container.Elements<GraphicFrame>()
                 .Where(gf => gf.Descendants<C.ChartReference>().Any()).ToList();
             if (elementIdx < 1 || elementIdx > charts.Count)
-                throw new ArgumentException($"Chart {elementIdx} not found");
+                throw new ArgumentException($"Chart {elementIdx} not found (total: {charts.Count})");
             var chartGf = charts[elementIdx - 1];
             // Clean up ChartPart
             var chartRef = chartGf.Descendants<C.ChartReference>().FirstOrDefault();
@@ -580,8 +582,9 @@ public partial class PowerPointHandler
         return null;
     }
 
-    public string Move(string sourcePath, string? targetParentPath, InsertPosition? position)
+    public string Move(string sourcePath, string? targetParentPath, InsertPosition? position, Dictionary<string, string>? properties = null)
     {
+        // pptx has no track-change concept; `properties` is accepted for IDocumentHandler parity but ignored.
         var index = position?.Index;
         sourcePath = ResolveIdPath(sourcePath);
         sourcePath = ResolveLastPredicates(sourcePath);
@@ -1461,7 +1464,6 @@ public partial class PowerPointHandler
     /// <summary>
     /// Clone an entire slide with all its content, relationships (images, charts, media),
     /// layout link, background, notes, and transitions.
-    /// Pattern follows POI's createSlide(layout) + importContent(srcSlide).
     /// </summary>
     private string CloneSlide(Match slideMatch, List<SlidePart> slideParts, int? index)
     {

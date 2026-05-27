@@ -2526,7 +2526,7 @@ public partial class WordHandler
            zeroed when it becomes :first-child of a new page-body. The
            ORIGINAL page-body (which holds the document's first paragraph)
            is intentionally not matched here, so its first-paragraph
-           spaceBefore renders the way Word / POI emit it. */
+           spaceBefore renders the way Word emits it. */
         .page-body-cont > :first-child {{ margin-top: 0 !important; }}
         .page-body > img + h1, .page-body > img + img + h1 {{ margin-top: 0 !important; }}
         .doc-header, .doc-footer {{ font-size: {dd.SizePt:0.##}pt; }}
@@ -2574,8 +2574,6 @@ public partial class WordHandler
         tr {{ break-inside: auto; }}
         th {{ font-weight: 600; }}
         .track-format {{ background: #FFF9C4; border-left: 4px solid #FFC107; }}
-        .track-move {{ text-decoration: underline double; color: #2E7D32; }}
-        .track-movefrom {{ text-decoration: line-through double; color: #2E7D32; }}
         .track-ins-row {{ background: #E8F5E9; }}
         .track-del-row {{ background: #FFEBEE; text-decoration: line-through; color: #C62828; }}
         @media print {{ body {{ background: white; padding: 0; }}

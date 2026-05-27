@@ -334,6 +334,150 @@ internal static partial class ChartHelper
             dPt.AppendChild(new C.Explosion { Val = explosion });
     }
 
+    /// <summary>
+    /// Get-or-create the <c:dPt> for the given 0-based point index and
+    /// position it within the schema-correct slot of the series. Returns
+    /// the existing element when present.
+    /// </summary>
+    private static C.DataPoint EnsureDataPoint(OpenXmlCompositeElement series, int pointIndex)
+    {
+        var dPts = series.Elements<C.DataPoint>().ToList();
+        var dPt = dPts.FirstOrDefault(dp => dp.Index?.Val?.Value == (uint)pointIndex);
+        if (dPt != null) return dPt;
+        dPt = new C.DataPoint();
+        dPt.AppendChild(new C.Index { Val = (uint)pointIndex });
+        var insertBefore = series.GetFirstChild<C.DataLabels>() as OpenXmlElement
+            ?? series.GetFirstChild<C.Trendline>() as OpenXmlElement
+            ?? series.GetFirstChild<C.ErrorBars>() as OpenXmlElement
+            ?? series.GetFirstChild<C.CategoryAxisData>() as OpenXmlElement
+            ?? series.GetFirstChild<C.Values>();
+        if (insertBefore != null) series.InsertBefore(dPt, insertBefore);
+        else series.AppendChild(dPt);
+        return dPt;
+    }
+
+    /// <summary>
+    /// Insert <paramref name="child"/> into the dPt in CT_DPt schema order:
+    /// idx, invertIfNegative, marker, bubble3D, explosion, dLbl, spPr, extLst.
+    /// </summary>
+    private static void InsertDataPointChildInOrder(C.DataPoint dPt, OpenXmlElement child)
+    {
+        // Find first existing child whose schema rank is strictly greater
+        // than the new child's rank; insert before it.
+        int Rank(OpenXmlElement el) => el switch
+        {
+            C.Index => 0,
+            C.InvertIfNegative => 1,
+            C.Marker => 2,
+            C.Bubble3D => 3,
+            C.Explosion => 4,
+            C.DataLabel => 5,
+            C.ChartShapeProperties => 6,
+            C.ExtensionList => 7,
+            _ => 99,
+        };
+        var newRank = Rank(child);
+        OpenXmlElement? anchor = null;
+        foreach (var existing in dPt.ChildElements)
+        {
+            if (Rank(existing) > newRank) { anchor = existing; break; }
+        }
+        if (anchor != null) dPt.InsertBefore(child, anchor);
+        else dPt.AppendChild(child);
+    }
+
+    internal static bool ApplyDataPointMarker(OpenXmlCompositeElement series, int pointIndex, string markerSpec)
+    {
+        // Mirror ApplySeriesMarker (style[:size[:color]]) but scope to the
+        // matching <c:dPt>. Reject unknown style tokens up the call chain so
+        // callers surface UNSUPPORTED instead of silent corruption.
+        var parts = markerSpec.Split(':');
+        var styleToken = parts[0].Trim().ToLowerInvariant();
+        C.MarkerStyleValues style;
+        switch (styleToken)
+        {
+            case "circle":   style = C.MarkerStyleValues.Circle; break;
+            case "diamond":  style = C.MarkerStyleValues.Diamond; break;
+            case "square":   style = C.MarkerStyleValues.Square; break;
+            case "triangle": style = C.MarkerStyleValues.Triangle; break;
+            case "star":     style = C.MarkerStyleValues.Star; break;
+            case "x":        style = C.MarkerStyleValues.X; break;
+            case "plus":     style = C.MarkerStyleValues.Plus; break;
+            case "dash":     style = C.MarkerStyleValues.Dash; break;
+            case "dot":      style = C.MarkerStyleValues.Dot; break;
+            case "none":     style = C.MarkerStyleValues.None; break;
+            case "auto":     style = C.MarkerStyleValues.Auto; break;
+            default:         return false;
+        }
+        var dPt = EnsureDataPoint(series, pointIndex);
+        var existing = dPt.GetFirstChild<C.Marker>();
+        var existingSize = existing?.GetFirstChild<C.Size>()?.CloneNode(true) as C.Size;
+        var existingSpPr = existing?.GetFirstChild<C.ChartShapeProperties>()?.CloneNode(true) as C.ChartShapeProperties;
+        dPt.RemoveAllChildren<C.Marker>();
+        var marker = new C.Marker();
+        marker.AppendChild(new C.Symbol { Val = style });
+        if (parts.Length > 1 && byte.TryParse(parts[1], out var size))
+            marker.AppendChild(new C.Size { Val = size });
+        else if (existingSize != null)
+            marker.AppendChild(existingSize);
+        if (parts.Length > 2)
+        {
+            var mSpPr = new C.ChartShapeProperties();
+            var fill = new Drawing.SolidFill();
+            fill.AppendChild(BuildChartColorElement(parts[2]));
+            mSpPr.AppendChild(fill);
+            marker.AppendChild(mSpPr);
+        }
+        else if (existingSpPr != null)
+            marker.AppendChild(existingSpPr);
+        InsertDataPointChildInOrder(dPt, marker);
+        return true;
+    }
+
+    internal static bool ApplyDataPointMarkerSize(OpenXmlCompositeElement series, int pointIndex, string value)
+    {
+        if (!byte.TryParse(value, out var size)) return false;
+        var dPt = EnsureDataPoint(series, pointIndex);
+        var marker = dPt.GetFirstChild<C.Marker>();
+        if (marker == null)
+        {
+            marker = new C.Marker();
+            InsertDataPointChildInOrder(dPt, marker);
+        }
+        marker.RemoveAllChildren<C.Size>();
+        // CT_Marker order: symbol, size, spPr, extLst — Size must follow Symbol.
+        var symbol = marker.GetFirstChild<C.Symbol>();
+        var sizeEl = new C.Size { Val = size };
+        if (symbol != null) symbol.InsertAfterSelf(sizeEl);
+        else marker.PrependChild(sizeEl);
+        return true;
+    }
+
+    internal static bool ApplyDataPointMarkerColor(OpenXmlCompositeElement series, int pointIndex, string color)
+    {
+        var dPt = EnsureDataPoint(series, pointIndex);
+        var marker = dPt.GetFirstChild<C.Marker>();
+        if (marker == null)
+        {
+            marker = new C.Marker();
+            InsertDataPointChildInOrder(dPt, marker);
+        }
+        var mSpPr = marker.GetFirstChild<C.ChartShapeProperties>();
+        if (mSpPr == null)
+        {
+            mSpPr = new C.ChartShapeProperties();
+            // CT_Marker schema order: symbol, size, spPr, extLst.
+            var anchor = marker.GetFirstChild<C.ExtensionList>() as OpenXmlElement;
+            if (anchor != null) marker.InsertBefore(mSpPr, anchor);
+            else marker.AppendChild(mSpPr);
+        }
+        mSpPr.RemoveAllChildren<Drawing.SolidFill>();
+        var fill = new Drawing.SolidFill();
+        fill.AppendChild(BuildChartColorElement(color));
+        mSpPr.PrependChild(fill);
+        return true;
+    }
+
     // ==================== Axis Line Styling ====================
 
     /// <summary>
@@ -714,6 +858,31 @@ internal static partial class ChartHelper
             }
 
             default:
+                // Per-series labelFont (compound + dotted) — mirrors the chart-level
+                // labelFont fan-out (Setter.cs cases `labelfont` / `labelfont.*`)
+                // but scoped to this series' own <c:dLbls>. Without this dispatch,
+                // `series{N}.labelFont*=` fell through to the catch-all `return
+                // false;` and surfaced as UNSUPPORTED even though the chart-level
+                // form worked. dLbls is created on the series if absent so the
+                // first labelFont set is non-destructive.
+                if (prop.Equals("labelfont", StringComparison.OrdinalIgnoreCase))
+                {
+                    var dl = EnsureSeriesDataLabels(ser);
+                    dl.RemoveAllChildren<C.TextProperties>();
+                    dl.PrependChild(BuildLabelTextProperties(value));
+                    return true;
+                }
+                if (prop.StartsWith("labelfont.", StringComparison.OrdinalIgnoreCase))
+                {
+                    var subkey = prop.Substring("labelfont.".Length).ToLowerInvariant();
+                    if (subkey is "color" or "size" or "bold" or "name" or "font")
+                    {
+                        var dl = EnsureSeriesDataLabels(ser);
+                        ApplyLabelFontSubkey(dl, subkey, value);
+                        return true;
+                    }
+                    return false;
+                }
                 // Trendline sub-properties: series{N}.trendline.name, .forward, .backward, etc.
                 // NOTE: this is an inner dispatch — if the sub-property is not one of
                 // ApplyTrendlineOptions' known cases it is silently ignored. See report:
@@ -737,6 +906,19 @@ internal static partial class ChartHelper
                             ApplyDataPointExplosion(ser, ptIdx - 1,
                                 uint.TryParse(value, out var pe) ? pe : 0u);
                             return true;
+                        // R38: per-point marker / markerSize / markerColor —
+                        // ApplySeriesMarker writes a <c:marker> on the <c:ser>
+                        // element; the data-point equivalent writes the same
+                        // <c:marker> child under the matching <c:dPt>. Reuse
+                        // the spec parser by routing through a per-point
+                        // applier that mirrors ApplySeriesMarker but scopes
+                        // to the dPt.
+                        case "marker":
+                            return ApplyDataPointMarker(ser, ptIdx - 1, value);
+                        case "markersize":
+                            return ApplyDataPointMarkerSize(ser, ptIdx - 1, value);
+                        case "markercolor":
+                            return ApplyDataPointMarkerColor(ser, ptIdx - 1, value);
                         default:
                             // Unknown point sub-property — surface as unsupported.
                             return false;
@@ -747,6 +929,28 @@ internal static partial class ChartHelper
                 // of a bogus "Updated" message.
                 return false;
         }
+    }
+
+    /// <summary>
+    /// Get-or-create a series-scoped &lt;c:dLbls&gt; container with the
+    /// minimal show* skeleton (mirrors EnsureDataLabelsOnAllChartGroups but
+    /// per-series). Used by per-series labelFont fan-out — the chart-level
+    /// EnsureDataLabelsOnAllChartGroups attaches dLbls under the chart-group,
+    /// not under each &lt;c:ser&gt;.
+    /// </summary>
+    private static C.DataLabels EnsureSeriesDataLabels(OpenXmlCompositeElement ser)
+    {
+        var existing = ser.GetFirstChild<C.DataLabels>();
+        if (existing != null) return existing;
+        var dLbls = new C.DataLabels();
+        dLbls.AppendChild(new C.ShowLegendKey { Val = false });
+        dLbls.AppendChild(new C.ShowValue { Val = false });
+        dLbls.AppendChild(new C.ShowCategoryName { Val = false });
+        dLbls.AppendChild(new C.ShowSeriesName { Val = false });
+        dLbls.AppendChild(new C.ShowPercent { Val = false });
+        dLbls.AppendChild(new C.ShowBubbleSize { Val = false });
+        InsertSeriesChildInOrder(ser, dLbls);
+        return dLbls;
     }
 
     private static bool TryParsePointKey(string prop, out int pointIndex, out string pointProp)

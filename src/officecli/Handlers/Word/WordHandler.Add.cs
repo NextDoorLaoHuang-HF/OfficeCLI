@@ -646,7 +646,7 @@ public partial class WordHandler
                 case "lastmodifiedby":
                     _doc.PackageProperties.LastModifiedBy = value;
                     break;
-                case "revision":
+                case "revisionnumber":
                     _doc.PackageProperties.Revision = value;
                     break;
 
@@ -701,15 +701,6 @@ public partial class WordHandler
                     protSettingsPart.Settings.Save();
                     break;
                 }
-
-                case "acceptallchanges" or "accept-changes" or "acceptchanges":
-                    if (value.Equals("all", StringComparison.OrdinalIgnoreCase) || IsTruthy(value))
-                        AcceptAllChanges();
-                    break;
-                case "rejectallchanges" or "reject-changes" or "rejectchanges":
-                    if (value.Equals("all", StringComparison.OrdinalIgnoreCase) || IsTruthy(value))
-                        RejectAllChanges();
-                    break;
 
                 default:
                     // Try document settings, section layout, compatibility, and docDefaults

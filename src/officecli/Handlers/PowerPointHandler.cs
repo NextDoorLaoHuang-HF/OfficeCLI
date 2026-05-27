@@ -145,6 +145,8 @@ public partial class PowerPointHandler : IDocumentHandler
     {
         Modified = true;
         if (partPath == null) throw new ArgumentNullException(nameof(partPath));
+        if (xpath == null) throw new ArgumentNullException(nameof(xpath));
+        if (action == null) throw new ArgumentNullException(nameof(action));
         var presentationPart = _doc.PresentationPart
             ?? throw new InvalidOperationException("No presentation part");
 
@@ -566,6 +568,65 @@ public partial class PowerPointHandler : IDocumentHandler
                 var layoutActualRid = saSlidePart.GetIdOfPart(layoutPart);
                 var colorsActualRid = saSlidePart.GetIdOfPart(colorsPart);
                 var styleActualRid  = saSlidePart.GetIdOfPart(stylePart);
+
+                // Inject a minimal <p:graphicFrame> into the slide's spTree
+                // so GetSmartArtsOnSlide (which finds SmartArt only via the
+                // graphicFrame + dgm:relIds anchor) can see this SmartArt on
+                // the next dump. Without the host frame, a SmartArt created
+                // by direct `add-part smartart` is silently dropped on dump.
+                // The dump-emitter path passes `skip-frame=true` because it
+                // raw-set appends the source's full graphicFrame (with real
+                // position/size/name) immediately after — otherwise we'd
+                // emit a stub-plus-real pair on every replay.
+                var skipFrame = properties != null
+                    && properties.TryGetValue("skip-frame", out var sf)
+                    && (sf == "true" || sf == "1");
+                if (!skipFrame)
+                {
+                    var saSlide = GetSlide(saSlidePart);
+                    var saSpTree = saSlide.CommonSlideData?.ShapeTree;
+                    if (saSpTree != null)
+                    {
+                        // Allocate a non-colliding cNvPr id within the slide.
+                        // R42-T1: spTree carries pptx-namespaced <p:nvSpPr>/<p:nvGrpSpPr>/<p:nvGraphicFramePr>
+                        // wrappers whose cNvPr maps to DocumentFormat.OpenXml.Presentation.NonVisualDrawingProperties,
+                        // NOT the Drawing-namespace type. The wrong SDK type matched zero descendants,
+                        // pinning nextId at 1 and colliding with nvGrpSpPr cNvPr id=1.
+                        uint nextId = 1;
+                        foreach (var nv in saSpTree.Descendants<DocumentFormat.OpenXml.Presentation.NonVisualDrawingProperties>())
+                        {
+                            if (nv.Id?.Value >= nextId) nextId = nv.Id!.Value + 1;
+                        }
+                        // CT_GraphicalObjectFrame: nvGraphicFramePr / xfrm /
+                        // graphic. xfrm carries a default 6"x4.5" host area
+                        // anchored at (1in, 1in) — PowerPoint will rescale
+                        // on first render anyway; the values just keep the
+                        // shape selectable.
+                        const long EmuIn = 914400;
+                        var gf = new DocumentFormat.OpenXml.Presentation.GraphicFrame(
+                            new DocumentFormat.OpenXml.Presentation.NonVisualGraphicFrameProperties(
+                                new DocumentFormat.OpenXml.Presentation.NonVisualDrawingProperties { Id = nextId, Name = $"Diagram {nextId}" },
+                                new DocumentFormat.OpenXml.Presentation.NonVisualGraphicFrameDrawingProperties(
+                                    new DocumentFormat.OpenXml.Drawing.GraphicFrameLocks { NoChangeAspect = true }),
+                                new DocumentFormat.OpenXml.Presentation.ApplicationNonVisualDrawingProperties()),
+                            new DocumentFormat.OpenXml.Presentation.Transform(
+                                new DocumentFormat.OpenXml.Drawing.Offset { X = 1 * EmuIn, Y = 1 * EmuIn },
+                                new DocumentFormat.OpenXml.Drawing.Extents { Cx = 6 * EmuIn, Cy = (long)(4.5 * EmuIn) }),
+                            new DocumentFormat.OpenXml.Drawing.Graphic(
+                                new DocumentFormat.OpenXml.Drawing.GraphicData(
+                                    new DocumentFormat.OpenXml.Drawing.Diagrams.RelationshipIds
+                                    {
+                                        DataPart = dataActualRid,
+                                        LayoutPart = layoutActualRid,
+                                        ColorPart = colorsActualRid,
+                                        StylePart = styleActualRid,
+                                    })
+                                { Uri = "http://schemas.openxmlformats.org/drawingml/2006/diagram" }));
+                        saSpTree.AppendChild(gf);
+                        saSlide.Save();
+                    }
+                }
+
                 var encoded = $"data={dataActualRid};layout={layoutActualRid};colors={colorsActualRid};quickStyle={styleActualRid}";
                 return (encoded, parentPartPath);
 
@@ -1565,6 +1626,53 @@ public partial class PowerPointHandler : IDocumentHandler
         if (pic == null) return null;
         var blip = pic.BlipFill?.GetFirstChild<DocumentFormat.OpenXml.Drawing.Blip>();
         var embedId = blip?.Embed?.Value;
+        if (string.IsNullOrEmpty(embedId)) return null;
+        try
+        {
+            var part = slidePart.GetPartById(embedId);
+            using var src = part.GetStream();
+            using var ms = new MemoryStream();
+            src.CopyTo(ms);
+            return (ms.ToArray(), part.ContentType);
+        }
+        catch { return null; }
+    }
+
+    // Resolve a shape path's blipFill image bytes (image fill on a non-Picture
+    // <p:sp>). Mirrors GetImageBinary but walks <p:sp> (Shape) instead of
+    // <p:pic> (Picture). Accepts /slide[N]/shape[K] and /slide[N]/shape[@id=ID]
+    // path forms (group-nested shape paths are NOT supported in this initial
+    // pass — covers the common slide-level blipFill case used by examples).
+    public (byte[] Bytes, string ContentType)? GetShapeImageFillBinary(string shapePath)
+    {
+        var m = Regex.Match(shapePath,
+            @"^/slide\[(\d+)\]/shape\[(@id=)?(\d+)\]$");
+        if (!m.Success) return null;
+        var slideIdx = int.Parse(m.Groups[1].Value);
+        var byId = m.Groups[2].Success;
+        var idOrIdx = int.Parse(m.Groups[3].Value);
+        var parts = GetSlideParts().ToList();
+        if (slideIdx < 1 || slideIdx > parts.Count) return null;
+        var slidePart = parts[slideIdx - 1];
+        var shapeTree = GetSlide(slidePart).CommonSlideData?.ShapeTree;
+        if (shapeTree == null) return null;
+        var shapes = shapeTree.Elements<Shape>().ToList();
+        Shape? shape = null;
+        if (byId)
+        {
+            shape = shapes.FirstOrDefault(s =>
+            {
+                var sid = s.NonVisualShapeProperties?.NonVisualDrawingProperties?.Id?.Value;
+                return sid.HasValue && sid.Value == (uint)idOrIdx;
+            });
+        }
+        else
+        {
+            if (idOrIdx >= 1 && idOrIdx <= shapes.Count) shape = shapes[idOrIdx - 1];
+        }
+        if (shape == null) return null;
+        var blipFill = shape.ShapeProperties?.GetFirstChild<DocumentFormat.OpenXml.Drawing.BlipFill>();
+        var embedId = blipFill?.GetFirstChild<DocumentFormat.OpenXml.Drawing.Blip>()?.Embed?.Value;
         if (string.IsNullOrEmpty(embedId)) return null;
         try
         {

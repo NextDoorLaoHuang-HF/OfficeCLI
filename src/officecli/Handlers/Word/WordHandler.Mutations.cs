@@ -16,9 +16,19 @@ namespace OfficeCli.Handlers;
 
 public partial class WordHandler
 {
-    public string? Remove(string path)
+    public string? Remove(string path, Dictionary<string, string>? properties = null)
     {
         Modified = true;
+
+        // Phase 4: remove + trackChange.* → produce w:del wrapper(s) instead
+        // of physically deleting. Run and Paragraph are supported; other
+        // element kinds (TableCell/Row/Section/...) throw out-of-scope.
+        // Intercepted *before* any container guard / shorthand resolution so
+        // the parsed element drives the kind dispatch directly.
+        if (properties != null && HasTrackChangeProps(properties))
+        {
+            return RemoveWithTrackChange(path, properties);
+        }
         // CONSISTENCY(container-remove-guard): reject removal of required
         // structural container elements up front. Without this guard,
         // `remove /body` / `remove /styles` etc. fall through to
@@ -773,8 +783,332 @@ public partial class WordHandler
         }
     }
 
-    public string Move(string sourcePath, string? targetParentPath, InsertPosition? position)
+    // ---------------------------------------------------------------------
+    // Phase 4: remove + trackChange.* (Run / Paragraph)
+    // ---------------------------------------------------------------------
+
+    private static bool HasTrackChangeProps(Dictionary<string, string> properties)
     {
+        foreach (var k in properties.Keys)
+        {
+            if (k.StartsWith("revision.", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private string? RemoveWithTrackChange(string path, Dictionary<string, string> properties)
+    {
+        // Phase 6: virtual /col[N] path — column is not a real OOXML element
+        // (no <w:col>); the operation marks every per-row cell at column N
+        // with <w:tcPr><w:cellDel/></w:tcPr>. Mirror the plain Remove path's
+        // own col-intercept (line ~116 above) so this also fires before the
+        // generic ParsePath/NavigateToElement (which would fail since col[N]
+        // is virtual).
+        var colMatch = Regex.Match(path, @"^/body/tbl\[(\d+)\]/col\[(\d+)\]$");
+        if (colMatch.Success)
+        {
+            return RemoveTableColumnWithTrackChange(colMatch, properties);
+        }
+
+        // Reuse the standard path parser + navigator. Container/shorthand
+        // intercepts in the plain Remove path don't apply: trackChange-mode
+        // remove only supports element-level Run/Paragraph/TableRow/TableCell.
+        var parts = ParsePath(path);
+        var element = NavigateToElement(parts, out var ctx)
+            ?? throw new ArgumentException($"Path not found: {path}" + (ctx != null ? $". {ctx}" : ""));
+
+        // Pull trackChange.* sub-props. Author defaults to "OfficeCLI",
+        // date defaults to UtcNow, id auto-allocated when omitted.
+        properties.TryGetValue("revision.author", out var tcAuthor);
+        properties.TryGetValue("revision.date", out var tcDateRaw);
+        properties.TryGetValue("revision.id", out var tcExplicitId);
+        if (string.IsNullOrEmpty(tcAuthor)) tcAuthor = "OfficeCLI";
+        DateTime tcDate = DateTime.UtcNow;
+        if (!string.IsNullOrEmpty(tcDateRaw) && DateTime.TryParse(tcDateRaw, out var parsedDate))
+            tcDate = parsedDate;
+
+        if (element is Run runEl)
+        {
+            // Already wrapped — reject so the agent fixes the call site
+            // rather than producing nested ins/del which Word silently drops.
+            if (runEl.Parent is InsertedRun || runEl.Parent is DeletedRun
+                || runEl.Parent is MoveFromRun || runEl.Parent is MoveToRun)
+                throw new InvalidOperationException(
+                    $"Cannot remove + trackChange a run already wrapped in an ins/del/moveFrom/moveTo at {path}.");
+
+            WrapRunAsDeleted(runEl, tcAuthor!, tcDate, tcExplicitId);
+        }
+        else if (element is Paragraph paraEl)
+        {
+            // Already inside a w:del or w:ins → out of scope.
+            if (paraEl.Ancestors().Any(a => a is InsertedRun || a is DeletedRun))
+                throw new InvalidOperationException(
+                    $"Cannot remove + trackChange a paragraph already inside an ins/del at {path}.");
+
+            // ¶ mark del — pPr/rPr/<w:del/>
+            var pPr = paraEl.ParagraphProperties ?? paraEl.PrependChild(new ParagraphProperties());
+            var pPrRpr = pPr.ParagraphMarkRunProperties
+                       ?? pPr.AppendChild(new ParagraphMarkRunProperties());
+            // Schema: paragraph-mark deletion marker is a bare <w:del>
+            // (no inner properties), child of w:rPr inside w:pPr.
+            var paraDel = new Deleted
+            {
+                Author = tcAuthor!,
+                Date = tcDate,
+                Id = !string.IsNullOrEmpty(tcExplicitId) ? tcExplicitId : GenerateRevisionId(),
+            };
+            pPrRpr.AppendChild(paraDel);
+
+            // Wrap every existing Run child in its own w:del with w:t → w:delText.
+            // Each run wrapper gets its own unique id (still distinct from the
+            // pPr/rPr/del marker id above). Explicit trackChange.id is *not*
+            // shared across paragraph-mark and content wrappers — the
+            // paragraph mark uses it, the per-run wrappers auto-allocate.
+            foreach (var r in paraEl.Elements<Run>().ToList())
+            {
+                WrapRunAsDeleted(r, tcAuthor!, tcDate, explicitId: null);
+            }
+        }
+        else if (element is TableRow rowEl)
+        {
+            // Phase 6: row-level deletion revision. Mirrors `add row +
+            // trackChange.author` (which adds <w:trPr><w:ins/></w:trPr>) —
+            // here we add <w:trPr><w:del/></w:trPr>. No cascade into the
+            // row's cells/runs (same A-route boundary as add row).
+            var trPr = rowEl.GetFirstChild<TableRowProperties>()
+                       ?? rowEl.PrependChild(new TableRowProperties());
+            trPr.AppendChild(new Deleted
+            {
+                Author = tcAuthor!,
+                Date = tcDate,
+                Id = !string.IsNullOrEmpty(tcExplicitId) ? tcExplicitId : GenerateRevisionId(),
+            });
+        }
+        else if (element is TableCell cellEl)
+        {
+            // Phase 6: cell-level deletion revision. <w:tcPr><w:cellDel/></w:tcPr>
+            // marks the cell as deleted; accept-all removes the cell from
+            // the row.
+            var tcPr = cellEl.GetFirstChild<TableCellProperties>()
+                       ?? cellEl.PrependChild(new TableCellProperties());
+            tcPr.AppendChild(new CellDeletion
+            {
+                Author = tcAuthor!,
+                Date = tcDate,
+                Id = !string.IsNullOrEmpty(tcExplicitId) ? tcExplicitId : GenerateRevisionId(),
+            });
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "remove + trackChange supports Run, Paragraph, TableRow, and TableCell only.");
+        }
+
+        // Refresh paragraph textId for the affected paragraph(s) so the
+        // dump/replay layer notices content changed.
+        var refreshPara = (element as Paragraph)
+                        ?? element.Ancestors<Paragraph>().FirstOrDefault();
+        if (refreshPara != null) refreshPara.TextId = GenerateParaId();
+
+        _doc.MainDocumentPart?.Document?.Save();
+        return null;
+    }
+
+    /// <summary>
+    /// Phase 6: virtual /col[N] removal with track changes. Marks every
+    /// per-row cell at column N with &lt;w:tcPr&gt;&lt;w:cellDel/&gt;&lt;/w:tcPr&gt;
+    /// instead of physically removing them. Mirrors the existing
+    /// RemoveTableColumn (line ~1935) but skips the cell+gridCol stripping.
+    /// </summary>
+    private string? RemoveTableColumnWithTrackChange(Match colMatch, Dictionary<string, string> properties)
+    {
+        var tableIdx = int.Parse(colMatch.Groups[1].Value);
+        var colIdx = int.Parse(colMatch.Groups[2].Value);
+        var body = _doc.MainDocumentPart?.Document?.Body
+            ?? throw new InvalidOperationException("Body not found");
+        var tables = body.Elements<Table>().ToList();
+        if (tableIdx < 1 || tableIdx > tables.Count)
+            throw new ArgumentException($"Table index {tableIdx} out of range");
+        var table = tables[tableIdx - 1];
+
+        properties.TryGetValue("revision.author", out var aRaw);
+        properties.TryGetValue("revision.date", out var dRaw);
+        var author = string.IsNullOrEmpty(aRaw) ? "OfficeCLI" : aRaw!;
+        DateTime date = !string.IsNullOrEmpty(dRaw) && DateTime.TryParse(dRaw, out var d) ? d : DateTime.UtcNow;
+
+        // Mark cell at colIdx in every row.
+        foreach (var row in table.Elements<TableRow>())
+        {
+            var cells = row.Elements<TableCell>().ToList();
+            if (colIdx < 1 || colIdx > cells.Count) continue; // skip short rows
+            var cell = cells[colIdx - 1];
+            var tcPr = cell.GetFirstChild<TableCellProperties>()
+                      ?? cell.PrependChild(new TableCellProperties());
+            tcPr.AppendChild(new CellDeletion
+            {
+                Author = author,
+                Date = date,
+                Id = GenerateRevisionId(),
+            });
+        }
+        _doc.MainDocumentPart?.Document?.Save();
+        return null;
+    }
+
+    /// <summary>
+    /// Wrap a single Run in a w:del marker, converting any inner w:t to w:delText.
+    /// Mirrors the ins/del wrapping done in WordHandler.Add.Text.cs.
+    /// </summary>
+    private DeletedRun? WrapRunAsDeleted(Run run, string author, DateTime date, string? explicitId)
+    {
+        var parentEl = run.Parent;
+        if (parentEl == null) return null;
+
+        var wrapper = new DeletedRun
+        {
+            Author = author,
+            Date = date,
+            Id = !string.IsNullOrEmpty(explicitId) ? explicitId : GenerateRevisionId(),
+        };
+        // w:t → w:delText so Word renders strikethrough content.
+        foreach (var t in run.Elements<Text>().ToList())
+        {
+            var dt = new DeletedText(t.Text ?? "") { Space = t.Space };
+            t.Parent?.ReplaceChild(dt, t);
+        }
+        parentEl.ReplaceChild(wrapper, run);
+        wrapper.AppendChild(run);
+        return wrapper;
+    }
+
+    /// <summary>Wrap a single Run in a w:ins marker (no text conversion —
+    /// inserted runs keep w:t). Mirrors <see cref="WrapRunAsDeleted"/>;
+    /// used from <c>BeginTrackChangeIfRequested</c> so `set <run>
+    /// --prop revision.type=ins` produces an InsertedRun wrapper instead
+    /// of silently degrading to an rPrChange (which would tag the run as
+    /// a *format* change rather than an *insertion*).</summary>
+    private InsertedRun? WrapRunAsInserted(Run run, string author, DateTime date, string? explicitId)
+    {
+        var parentEl = run.Parent;
+        if (parentEl == null) return null;
+        var wrapper = new InsertedRun
+        {
+            Author = author,
+            Date = date,
+            Id = !string.IsNullOrEmpty(explicitId) ? explicitId : GenerateRevisionId(),
+        };
+        parentEl.ReplaceChild(wrapper, run);
+        wrapper.AppendChild(run);
+        return wrapper;
+    }
+
+    /// <summary>Wrap a single Run in a w:moveFrom marker. Per
+    /// ECMA-376 §17.3.3.34, w:delText is only valid inside &lt;w:del&gt;,
+    /// never inside &lt;w:moveFrom&gt; — Word renders strikethrough for
+    /// moveFrom content via the moveFrom wrapper itself, not via delText.
+    /// Caller must supply an explicit id so the moveTo half can be paired.
+    ///
+    /// Also brackets the wrapper with MoveFromRangeStart / MoveFromRangeEnd
+    /// siblings carrying `Name="Move_{id}"`. Without the range markers
+    /// Word (especially Word for Mac) refuses to open the document with
+    /// "Word found unreadable content"; even where it opens, the
+    /// reviewing pane fails to pair the moveFrom with its moveTo. The
+    /// shared `w:name` between the two halves is what Word's UI keys off
+    /// (ECMA-376 §17.13.5.20-23). MoveWithTrackChange (the high-level
+    /// auto-pair Move command) already does this; mirror it here so the
+    /// low-level `set --prop revision.type=moveFrom` path produces the
+    /// same valid shape.</summary>
+    private void WrapRunAsMoveFrom(Run run, string author, DateTime date, string id)
+    {
+        var parentEl = run.Parent;
+        if (parentEl == null) return;
+        var wrapper = new MoveFromRun { Author = author, Date = date, Id = id };
+        parentEl.ReplaceChild(wrapper, run);
+        wrapper.AppendChild(run);
+
+        // Range marker placement. When the new wrapper's immediate
+        // predecessor is already a MoveFromRangeEnd with the same id,
+        // the caller is extending a contiguous move range (typical
+        // for `set` invoked sequentially on r[2], r[3], r[4] with a
+        // shared revision.id): remove that End to extend the existing
+        // range over us, and append a fresh End after this wrapper.
+        // Without this coalescence we'd produce N independent
+        // RangeStart/End pairs all sharing the same `w:name`, which
+        // Mac Word renders as a single "Deleted" entry (losing the
+        // move-vs-delete distinction) instead of one Move spanning
+        // the runs.
+        var moveName = $"Move_{id}";
+        var prevSibling = wrapper.PreviousSibling();
+        bool extendExisting = prevSibling is MoveFromRangeEnd prevEnd
+                              && prevEnd.Id?.Value == id;
+        if (extendExisting)
+        {
+            prevSibling!.Remove();
+        }
+        else
+        {
+            wrapper.InsertBeforeSelf(new MoveFromRangeStart
+            {
+                Id = id,
+                Author = author,
+                Date = date,
+                Name = moveName,
+            });
+        }
+        wrapper.InsertAfterSelf(new MoveFromRangeEnd { Id = id });
+    }
+
+    /// <summary>Wrap a single Run in a w:moveTo marker (no text
+    /// conversion — moveTo keeps w:t, mirrors w:ins). Caller must supply
+    /// an explicit id matching the paired moveFrom. Brackets the
+    /// wrapper with MoveToRangeStart / MoveToRangeEnd carrying
+    /// `Name="Move_{id}"` — see <see cref="WrapRunAsMoveFrom"/> for the
+    /// rationale.</summary>
+    private void WrapRunAsMoveTo(Run run, string author, DateTime date, string id)
+    {
+        var parentEl = run.Parent;
+        if (parentEl == null) return;
+        var wrapper = new MoveToRun { Author = author, Date = date, Id = id };
+        parentEl.ReplaceChild(wrapper, run);
+        wrapper.AppendChild(run);
+
+        // Range marker placement — same contiguous-extension trick as
+        // <see cref="WrapRunAsMoveFrom"/>: when the new wrapper's
+        // predecessor is a matching MoveToRangeEnd, drop it and rely
+        // on the existing Start to bracket the extended range.
+        var moveName = $"Move_{id}";
+        var prevSibling = wrapper.PreviousSibling();
+        bool extendExisting = prevSibling is MoveToRangeEnd prevEnd
+                              && prevEnd.Id?.Value == id;
+        if (extendExisting)
+        {
+            prevSibling!.Remove();
+        }
+        else
+        {
+            wrapper.InsertBeforeSelf(new MoveToRangeStart
+            {
+                Id = id,
+                Author = author,
+                Date = date,
+                Name = moveName,
+            });
+        }
+        wrapper.InsertAfterSelf(new MoveToRangeEnd { Id = id });
+    }
+
+    public string Move(string sourcePath, string? targetParentPath, InsertPosition? position, Dictionary<string, string>? properties = null)
+    {
+        // Detect track-change branch: any trackChange.author/date/id signals
+        // the high-level "auto-pair moveFrom/moveTo" form. Bare `trackChange=`
+        // is NOT consumed here — only the sub-keys; the low-level synthesis
+        // form (--prop trackChange=moveFrom on `add run`) still lives in Add.
+        if (properties != null && HasTrackChangeMoveProps(properties))
+        {
+            return MoveWithTrackChange(sourcePath, targetParentPath, position, properties);
+        }
+
         // Virtual table column path — same-table only. OOXML has no <w:col>
         // element; the move is a (gridCol + per-row tc) shuffle in lockstep.
         var colMoveMatch = Regex.Match(sourcePath, @"^/body/tbl\[(\d+)\]/col\[(\d+)\]$");
@@ -891,6 +1225,195 @@ public partial class WordHandler
         var siblings = targetParent.ChildElements.Where(e => e.LocalName == element.LocalName).ToList();
         var newIdx = siblings.IndexOf(element) + 1;
         return $"{effectiveParentPath}/{element.LocalName}[{newIdx}]";
+    }
+
+    /// <summary>
+    /// True if any of the trackChange sub-keys (author/date/id) appear in the
+    /// caller-supplied --prop dict. Case-insensitive — the CLI dict already
+    /// uses OrdinalIgnoreCase but plugin/JSON paths may not.
+    /// </summary>
+    private static bool HasTrackChangeMoveProps(Dictionary<string, string> props)
+    {
+        foreach (var key in props.Keys)
+        {
+            var k = key.ToLowerInvariant();
+            if (k == "revision.author" || k == "revision.date" || k == "revision.id")
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// High-level run-level move + trackChange: source stays in place wrapped
+    /// in &lt;w:moveFrom&gt; (with w:t→w:delText conversion); dest is a clone
+    /// of the source content wrapped in &lt;w:moveTo&gt; appended to target
+    /// paragraph. Both share the same w:id so Word recognises the pair.
+    /// Returns the dest path.
+    /// </summary>
+    private string MoveWithTrackChange(string sourcePath, string? targetParentPath, InsertPosition? position, Dictionary<string, string> properties)
+    {
+        var srcParts = ParsePath(sourcePath);
+        var element = NavigateToElement(srcParts)
+            ?? throw new ArgumentException($"Source not found: {sourcePath}");
+
+        // Run-level only (paragraph-level move tracking needs different
+        // OOXML — w:moveFromRangeStart/End + w:moveToRangeStart/End markers
+        // outside the paragraph boundary; out of scope for Phase 3).
+        if (element.LocalName != "r")
+            throw new ArgumentException(
+                $"move + trackChange is supported for run-level paths only (got {element.LocalName}). "
+                + "Paragraph-level move tracking (moveFromRangeStart/End markers) is not yet supported.");
+
+        // Reject re-moving an element already inside a moveFrom/moveTo —
+        // would produce nested move markers which Word treats as malformed.
+        if (element.Ancestors<MoveFromRun>().Any() || element.Ancestors<MoveToRun>().Any())
+            throw new InvalidOperationException(
+                "Source run is already inside a moveFrom/moveTo wrapper; nested move tracking is not supported.");
+
+        // Resolve target parent (--to is required for trackChange branch).
+        var anchorFullPath = position?.After ?? position?.Before;
+        if (string.IsNullOrEmpty(targetParentPath) && anchorFullPath != null && anchorFullPath.StartsWith("/"))
+        {
+            var lastSlash = anchorFullPath.LastIndexOf('/');
+            if (lastSlash > 0)
+                targetParentPath = anchorFullPath[..lastSlash];
+        }
+        if (string.IsNullOrEmpty(targetParentPath))
+            throw new ArgumentException(
+                "move + trackChange requires --to <paragraph-path>; reordering within the same parent is not meaningful for run-level move tracking.");
+
+        OpenXmlElement targetParent;
+        var tgtParts = ParsePath(targetParentPath);
+        targetParent = NavigateToElement(tgtParts)
+            ?? throw new ArgumentException($"Target parent not found: {targetParentPath}");
+
+        if (targetParent.LocalName != "p")
+            throw new ArgumentException(
+                $"move + trackChange target parent must be a paragraph (got {targetParent.LocalName}). "
+                + "Runs must live inside a paragraph.");
+
+        // Pull trackChange.* props (case-insensitive lookup).
+        string? tcAuthor = null, tcDate = null, tcId = null;
+        foreach (var kv in properties)
+        {
+            var k = kv.Key.ToLowerInvariant();
+            if (k == "revision.author") tcAuthor = kv.Value;
+            else if (k == "revision.date") tcDate = kv.Value;
+            else if (k == "revision.id") tcId = kv.Value;
+        }
+        if (string.IsNullOrEmpty(tcAuthor)) tcAuthor = "OfficeCLI";
+        DateTime tcDt = DateTime.UtcNow;
+        if (!string.IsNullOrEmpty(tcDate))
+            DateTime.TryParse(tcDate, out tcDt);
+        var sharedId = !string.IsNullOrEmpty(tcId) ? tcId! : GenerateRevisionId();
+
+        // Build the moveTo side first using a deep clone of the source run
+        // (keep <w:t> intact). Append it to target paragraph at the requested
+        // position. We compute the new path before wrapping the source so
+        // r-index counts on the source side don't drift.
+        var destRun = (Run)element.CloneNode(deep: true);
+        var moveTo = new MoveToRun
+        {
+            Id = sharedId,
+            Author = tcAuthor,
+            Date = tcDt,
+        };
+        moveTo.AppendChild(destRun);
+
+        // Resolve insert anchors for the dest side (relative to targetParent).
+        OpenXmlElement? afterAnchor = null, beforeAnchor = null;
+        if (position?.After != null)
+        {
+            var anchorPath = position.After;
+            if (!anchorPath.StartsWith("/"))
+                anchorPath = targetParentPath!.TrimEnd('/') + "/" + anchorPath;
+            afterAnchor = NavigateToElement(ParsePath(anchorPath))
+                ?? throw new ArgumentException($"After anchor not found: {position.After}");
+        }
+        else if (position?.Before != null)
+        {
+            var anchorPath = position.Before;
+            if (!anchorPath.StartsWith("/"))
+                anchorPath = targetParentPath!.TrimEnd('/') + "/" + anchorPath;
+            beforeAnchor = NavigateToElement(ParsePath(anchorPath))
+                ?? throw new ArgumentException($"Before anchor not found: {position.Before}");
+        }
+
+        if (afterAnchor != null) afterAnchor.InsertAfterSelf(moveTo);
+        else if (beforeAnchor != null) beforeAnchor.InsertBeforeSelf(moveTo);
+        else if (position?.Index is int idx)
+        {
+            var sameTypeSiblings = targetParent.ChildElements
+                .Where(e => e.LocalName == "r" || e is MoveToRun || e is MoveFromRun).ToList();
+            if (idx >= 0 && idx < sameTypeSiblings.Count)
+                sameTypeSiblings[idx].InsertBeforeSelf(moveTo);
+            else
+                targetParent.AppendChild(moveTo);
+        }
+        else targetParent.AppendChild(moveTo);
+
+        // Wrap the source in moveFrom. Per ECMA-376 §17.3.3.34 w:delText
+        // is only valid inside <w:del>, never inside <w:moveFrom> — Word
+        // renders strikethrough for moveFrom content from the moveFrom
+        // wrapper itself. The earlier t→delText conversion here tripped
+        // Word's "found unreadable content" recovery (Word re-wrapped
+        // the orphan delText in a synthetic <w:del w:author="Unknown">).
+        var srcParent = element.Parent
+            ?? throw new InvalidOperationException("Source run has no parent");
+        var moveFrom = new MoveFromRun
+        {
+            Id = sharedId,
+            Author = tcAuthor,
+            Date = tcDt,
+        };
+        srcParent.ReplaceChild(moveFrom, element);
+        moveFrom.AppendChild(element);
+
+        // Range markers bracket each half of the move pair. Without them
+        // Word does not recognise the moveFrom/moveTo runs as a "move" —
+        // on open it pops "found unreadable content" and silently demotes
+        // the pair to del+ins (the inner w:id pair is lost). Schema
+        // permits the markers to be omitted (validate stays green), but
+        // Word's UI keys off the shared `w:name` between MoveFromRangeStart
+        // and MoveToRangeStart to bind the two halves. Per ECMA-376 §17.13.5.20-23.
+        //
+        // Convention:
+        //   - moveFromRangeStart / moveToRangeStart carry w:name="Move_{id}";
+        //     identical on both sides so Word pairs them.
+        //   - The four range markers reuse `sharedId` as their `w:id` so
+        //     accept/reject can find them by id alongside the inner runs.
+        var moveName = $"Move_{sharedId}";
+        var mfRangeStart = new MoveFromRangeStart
+        {
+            Id = sharedId,
+            Author = tcAuthor,
+            Date = tcDt,
+            Name = moveName,
+        };
+        var mfRangeEnd = new MoveFromRangeEnd { Id = sharedId };
+        moveFrom.InsertBeforeSelf(mfRangeStart);
+        moveFrom.InsertAfterSelf(mfRangeEnd);
+
+        var mtRangeStart = new MoveToRangeStart
+        {
+            Id = sharedId,
+            Author = tcAuthor,
+            Date = tcDt,
+            Name = moveName,
+        };
+        var mtRangeEnd = new MoveToRangeEnd { Id = sharedId };
+        moveTo.InsertBeforeSelf(mtRangeStart);
+        moveTo.InsertAfterSelf(mtRangeEnd);
+
+        _doc.MainDocumentPart?.Document?.Save();
+
+        // Path to dest run: moveTo is now a sibling among target paragraph's
+        // children. The Run lives inside it; the watcher / GetAllRuns model
+        // descends into MoveToRun (Descendants<Run>()), so the run keeps a
+        // stable r[N] index in the target paragraph's run list.
+        var allRunsInTarget = targetParent.Descendants<Run>().ToList();
+        var rIdx = allRunsInTarget.IndexOf(destRun) + 1;
+        return $"{targetParentPath.TrimEnd('/')}/r[{rIdx}]";
     }
 
     public (string NewPath1, string NewPath2) Swap(string path1, string path2)
@@ -1341,6 +1864,76 @@ public partial class WordHandler
             if (trIns != null) { trIns.Remove(); count++; }
         }
 
+        // Accept w:tcPrChange (P5: high-level set + trackChange on table cell)
+        foreach (var tcPrChange in body.Descendants<TableCellPropertiesChange>().ToList())
+        {
+            tcPrChange.Remove();
+            count++;
+        }
+
+        // Accept w:trPrChange (P5: high-level set + trackChange on table row;
+        // distinct from the row-level <w:ins/> marker handled above which lives
+        // inside trPr directly — *Change carries the previous trPr snapshot).
+        foreach (var trPrChange in body.Descendants<TableRowPropertiesChange>().ToList())
+        {
+            trPrChange.Remove();
+            count++;
+        }
+
+        // Accept paragraph-mark deletion markers (P4: remove paragraph +
+        // trackChange writes <w:del/> into pPr/rPr to mark the ¶ as deleted).
+        // Word UX: accepting a ¶ del merges this paragraph with the NEXT one
+        // (because removing ¶ joins paragraphs). When this paragraph's content
+        // was also wrapped in <w:del> (the dual-marker form P4 emits), the
+        // content has already been removed above by the DeletedRun loop, so
+        // accepting the ¶ del here simply makes the empty paragraph disappear
+        // by merging into the next.
+        foreach (var pMark in body.Descendants<ParagraphMarkRunProperties>().ToList())
+        {
+            var paraDel = pMark.GetFirstChild<Deleted>();
+            if (paraDel == null) continue;
+            var thisPara = pMark.Ancestors<Paragraph>().FirstOrDefault();
+            if (thisPara == null) continue;
+            var nextPara = thisPara.NextSibling<Paragraph>();
+            paraDel.Remove();
+            count++;
+            // Merge: append this paragraph's runs (and any remaining inline
+            // content) to the next paragraph, then remove this empty paragraph.
+            // If there is no next paragraph (this was the last in body/cell),
+            // just drop the ¶ del marker — the empty paragraph stays so the
+            // container isn't left without any paragraph (OOXML requires at
+            // least one for body / cell).
+            if (nextPara != null)
+            {
+                // Move all run-level children (Run, hyperlink, etc) — anything
+                // that isn't ParagraphProperties — to the FRONT of nextPara,
+                // preserving order. nextPara may itself start with pPr; insert
+                // after that.
+                var movable = thisPara.ChildElements
+                    .Where(c => c is not ParagraphProperties)
+                    .ToList();
+                var nextPPr = nextPara.GetFirstChild<ParagraphProperties>();
+                OpenXmlElement insertAfter = nextPPr ?? (OpenXmlElement?)null!;
+                foreach (var ch in movable)
+                {
+                    ch.Remove();
+                    if (insertAfter == null) nextPara.PrependChild(ch);
+                    else { insertAfter.InsertAfterSelf(ch); insertAfter = ch; }
+                }
+                thisPara.Remove();
+            }
+        }
+
+        // Accept paragraph-mark insertion markers (¶ ins inside pPr/rPr — would
+        // be emitted by a future "add paragraph + trackChange" high-level form;
+        // currently produced manually or by Word). Accept = the paragraph stays,
+        // just drop the marker.
+        foreach (var pMark in body.Descendants<ParagraphMarkRunProperties>().ToList())
+        {
+            var paraIns = pMark.GetFirstChild<Inserted>();
+            if (paraIns != null) { paraIns.Remove(); count++; }
+        }
+
         // Accept w:moveTo / w:moveFrom
         foreach (var moveFrom in body.Descendants<MoveFromRun>().ToList())
         {
@@ -1530,6 +2123,84 @@ public partial class WordHandler
                 tblPrChange.Remove();
             }
             count++;
+        }
+
+        // Reject w:tcPrChange — restore original table cell properties (P5)
+        foreach (var tcPrChange in body.Descendants<TableCellPropertiesChange>().ToList())
+        {
+            var tcPr = tcPrChange.Parent as TableCellProperties;
+            if (tcPr != null)
+            {
+                var originalProps = tcPrChange.GetFirstChild<PreviousTableCellProperties>();
+                if (originalProps != null)
+                {
+                    var tc = tcPr.Parent;
+                    if (tc != null)
+                    {
+                        var newTcPr = new TableCellProperties();
+                        foreach (var child in originalProps.ChildElements.ToList())
+                            newTcPr.AppendChild(child.CloneNode(true));
+                        tc.ReplaceChild(newTcPr, tcPr);
+                    }
+                }
+                else tcPrChange.Remove();
+            }
+            else tcPrChange.Remove();
+            count++;
+        }
+
+        // Reject w:trPrChange — restore original table row properties (P5)
+        foreach (var trPrChange in body.Descendants<TableRowPropertiesChange>().ToList())
+        {
+            var trPr = trPrChange.Parent as TableRowProperties;
+            if (trPr != null)
+            {
+                var originalProps = trPrChange.GetFirstChild<PreviousTableRowProperties>();
+                if (originalProps != null)
+                {
+                    var tr = trPr.Parent;
+                    if (tr != null)
+                    {
+                        var newTrPr = new TableRowProperties();
+                        foreach (var child in originalProps.ChildElements.ToList())
+                            newTrPr.AppendChild(child.CloneNode(true));
+                        tr.ReplaceChild(newTrPr, trPr);
+                    }
+                }
+                else trPrChange.Remove();
+            }
+            else trPrChange.Remove();
+            count++;
+        }
+
+        // Reject paragraph-mark deletion (P4: ¶ del inside pPr/rPr).
+        // Reject means: undelete the paragraph mark. Just drop the marker; the
+        // paragraph stays as a normal paragraph break. The companion content
+        // <w:del> wrappers are independently unwrapped by the DeletedRun loop
+        // above, restoring the original text.
+        foreach (var pMark in body.Descendants<ParagraphMarkRunProperties>().ToList())
+        {
+            var paraDel = pMark.GetFirstChild<Deleted>();
+            if (paraDel != null) { paraDel.Remove(); count++; }
+            var paraIns = pMark.GetFirstChild<Inserted>();
+            if (paraIns != null)
+            {
+                // Reject ¶ ins: the paragraph break itself was inserted →
+                // unbreak. Merge this paragraph into the previous one.
+                paraIns.Remove();
+                count++;
+                var thisPara = pMark.Ancestors<Paragraph>().FirstOrDefault();
+                var prevPara = thisPara?.PreviousSibling<Paragraph>();
+                if (thisPara != null && prevPara != null)
+                {
+                    foreach (var ch in thisPara.ChildElements.Where(c => c is not ParagraphProperties).ToList())
+                    {
+                        ch.Remove();
+                        prevPara.AppendChild(ch);
+                    }
+                    thisPara.Remove();
+                }
+            }
         }
 
         // Reject w:moveTo — remove (discard the move target)

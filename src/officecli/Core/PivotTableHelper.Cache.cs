@@ -356,6 +356,53 @@ internal static partial class PivotTableHelper
 
     // ==================== Cache Definition Builder ====================
 
+    /// <summary>
+    /// Re-derive (fieldNumeric, fieldValueIndex) from an existing (shared)
+    /// PivotCacheDefinition. Use this in the cache-reuse path INSTEAD of a
+    /// throwaway BuildCacheDefinition, so the maps reflect the cache that
+    /// will actually be on disk (sharedItems order = whatever the FIRST
+    /// pivot to build the cache wrote, NOT what re-sorting under THIS
+    /// pivot's sort mode would produce).
+    /// </summary>
+    internal static (bool[] fieldNumeric, Dictionary<string, int>[] fieldValueIndex)
+        ReadFieldValueIndexFromCache(PivotCacheDefinition? cacheDef, string[] headers)
+    {
+        var fieldNumeric = new bool[headers.Length];
+        var fieldValueIndex = new Dictionary<string, int>[headers.Length];
+        for (int i = 0; i < headers.Length; i++)
+            fieldValueIndex[i] = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (cacheDef == null) return (fieldNumeric, fieldValueIndex);
+
+        var cacheFields = cacheDef.GetFirstChild<CacheFields>();
+        if (cacheFields == null) return (fieldNumeric, fieldValueIndex);
+
+        int colIdx = 0;
+        foreach (var cf in cacheFields.Elements<CacheField>())
+        {
+            if (colIdx >= headers.Length) break;
+            var si = cf.GetFirstChild<SharedItems>();
+            if (si == null) { colIdx++; continue; }
+
+            // Numeric (no enumerated string items) — record by ContainsNumber.
+            if (si.ContainsNumber?.Value == true && !si.Elements<StringItem>().Any())
+            {
+                fieldNumeric[colIdx] = true;
+            }
+            else
+            {
+                int sharedIdx = 0;
+                foreach (var item in si.ChildElements)
+                {
+                    if (item is StringItem s && s.Val?.Value != null)
+                        fieldValueIndex[colIdx][s.Val.Value] = sharedIdx;
+                    sharedIdx++;
+                }
+            }
+            colIdx++;
+        }
+        return (fieldNumeric, fieldValueIndex);
+    }
+
     private static (PivotCacheDefinition def, bool[] fieldNumeric, Dictionary<string, int>[] fieldValueIndex)
         BuildCacheDefinition(
             string sourceSheetName, string sourceRef,

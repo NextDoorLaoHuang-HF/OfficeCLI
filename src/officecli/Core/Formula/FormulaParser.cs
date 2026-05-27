@@ -183,7 +183,20 @@ internal static class FormulaParser
                     var styVal = sty?.GetAttribute("val", "http://schemas.openxmlformats.org/officeDocument/2006/math").Value;
                     var hasNor = rPr.ChildElements.Any(e => e.LocalName == "nor");
                     if (hasNor)
-                        result = $"\\text{{{EscapeLatex(text)}}}";
+                    {
+                        // m:nor (NormalText) flags an upright run. Function
+                        // names like sin/cos/tan/log/ln go through this same
+                        // node on the write path (see ParseCommand case "lim"
+                        // or "sin" or "cos" ...), so an upright run whose text
+                        // is one of those names round-trips back to \sin
+                        // rather than \text{sin}. CONSISTENCY(formula-funcname):
+                        // keep this set in sync with the upright-name list in
+                        // ParseCommand's "lim or sin or cos ..." arm.
+                        if (_uprightFunctionNames.Contains(text))
+                            result = "\\" + text;
+                        else
+                            result = $"\\text{{{EscapeLatex(text)}}}";
+                    }
                     else if (styVal == "b")
                         result = $"\\mathbf{{{EscapeLatex(text)}}}";
                     else if (styVal == "bi")
@@ -346,8 +359,17 @@ internal static class FormulaParser
             case "m": // matrix
             {
                 var matrixRows = element.ChildElements.Where(e => e.LocalName == "mr").ToList();
+                // Trim each cell's leading/trailing whitespace before joining
+                // with " & "/" \\\\ ". The tokenizer collapses runs of ordinary
+                // characters into a single Text token that includes surrounding
+                // spaces (e.g. "a " before "&", " b " between "&" and "\\\\"),
+                // so a raw join produces "a  &  b  \\\\  c" and round-trips
+                // accumulate one space per pass. Trimming at the cell boundary
+                // restores "a & b \\\\ c & d" — matrix delimiters carry their
+                // own spacing semantics in LaTeX, so cell-internal padding adds
+                // nothing.
                 var rowStrings = matrixRows.Select(mr =>
-                    string.Join(" & ", mr.ChildElements.Where(e => e.LocalName == "e").Select(ArgToLatex)));
+                    string.Join(" & ", mr.ChildElements.Where(e => e.LocalName == "e").Select(e => ArgToLatex(e).Trim())));
                 var content = string.Join(" \\\\ ", rowStrings);
                 // Standalone matrix (not inside a delimiter) needs environment wrapper
                 if (element.Parent?.LocalName != "e" || element.Parent?.Parent?.LocalName != "d")
@@ -604,8 +626,15 @@ internal static class FormulaParser
                         i++;
                         break;
                     }
-                    // Escaped special chars: \{ \} \| → literal text
-                    if (i < input.Length && (input[i] == '{' || input[i] == '}' || input[i] == '|'))
+                    // \| → double vertical bar (‖), distinct from \{ \} which are literal
+                    if (i < input.Length && input[i] == '|')
+                    {
+                        tokens.Add(new Token(TokenType.Command, "Vert"));
+                        i++;
+                        break;
+                    }
+                    // Escaped braces: \{ \} → literal text
+                    if (i < input.Length && (input[i] == '{' || input[i] == '}'))
                     {
                         tokens.Add(new Token(TokenType.Text, input[i].ToString()));
                         i++;
@@ -807,6 +836,22 @@ internal static class FormulaParser
             // Single character for shorthand: H_2 takes just "2", but "2O" should take just "2"
             var text = tokens[pos].Value;
             pos++;
+            // Strip leading whitespace before picking the single char. The
+            // tokenizer collapses ordinary characters into one Text token that
+            // can include the separator space between a command and its
+            // argument (e.g. "\sum_{i=1}^n i" tokenises the trailing arg as
+            // " i", and "\sin x" tokenises as " x"). Without this skip, the
+            // first char picked was the space itself and the actual argument
+            // (i, x) leaked out as a sibling sitting outside the nary / func.
+            int leadingWs = 0;
+            while (leadingWs < text.Length && char.IsWhiteSpace(text[leadingWs]))
+                leadingWs++;
+            if (leadingWs >= text.Length)
+            {
+                // Token was pure whitespace — fall through to empty arg.
+                return MakeMathRun("");
+            }
+            text = text[leadingWs..];
             if (text.Length == 1)
                 return MakeMathRun(text);
             // For multi-char text in a subscript/superscript arg without braces, take only first char
@@ -1219,11 +1264,13 @@ internal static class FormulaParser
                 };
                 if (cmd is "mathbb" or "mathcal")
                 {
-                    // Double-struck and calligraphic: use NormalText + special Unicode if available,
-                    // otherwise render as styled text with script style
-                    var rPr = new M.RunProperties(new M.NormalText());
-                    if (cmd == "mathcal")
-                        rPr = new M.RunProperties(new M.Style { Val = M.StyleValues.Plain }, new M.Script());
+                    var scriptVal = cmd == "mathbb"
+                        ? M.ScriptValues.DoubleStruck
+                        : M.ScriptValues.Script;
+                    var rPr = new M.RunProperties(
+                        new M.Script { Val = scriptVal },
+                        new M.Style { Val = M.StyleValues.Plain }
+                    );
                     return new M.Run(
                         rPr,
                         new M.Text(text) { Space = SpaceProcessingModeValues.Preserve }
@@ -1594,7 +1641,10 @@ internal static class FormulaParser
                 for (int ci = 0; ci < colCount; ci++)
                 {
                     mcs.AppendChild(new M.MatrixColumn(
-                        new M.MatrixColumnJustification { Val = M.HorizontalAlignmentValues.Left }
+                        new M.MatrixColumnProperties(
+                            new M.MatrixColumnCount { Val = 1 },
+                            new M.MatrixColumnJustification { Val = M.HorizontalAlignmentValues.Left }
+                        )
                     ));
                 }
                 mPr.AppendChild(mcs);
@@ -1749,6 +1799,18 @@ internal static class FormulaParser
         "leftrightarrow" => "↔",
         "Leftrightarrow" => "⇔",
         "rightleftharpoons" => "⇌",
+        "to" => "→",
+        "gets" => "←",
+        "mapsto" => "↦",
+        "iff" => "⟺",
+        "implies" => "⟹",
+        "impliedby" => "⟸",
+        // Logic
+        "land" or "wedge" => "∧",
+        "lor" or "vee" => "∨",
+        "lnot" or "neg" => "¬",
+        "mid" => "∣",
+        "parallel" => "∥",
         // Operators
         "pm" => "±",
         "mp" => "∓",
@@ -1850,6 +1912,17 @@ internal static class FormulaParser
         "Psi" => "Ψ",
         "Omega" => "Ω",
         _ => null
+    };
+
+    // Function names written by ParseCommand's `case "lim" or "sin" or ...`
+    // arm as an m:r + m:nor + literal text. Round-trip back to "\name" on the
+    // OMML→LaTeX side when an upright run's payload matches one of these.
+    // CONSISTENCY(formula-funcname): mirrors the list in ParseCommand.
+    private static readonly HashSet<string> _uprightFunctionNames = new(StringComparer.Ordinal)
+    {
+        "lim", "sin", "cos", "tan", "log", "ln", "exp", "min", "max",
+        "sup", "inf", "det", "gcd", "dim", "ker", "hom", "deg",
+        "arg", "sec", "csc", "cot", "sinh", "cosh", "tanh"
     };
 
     private static readonly (string Symbol, string Command)[] SymbolToCommandMap = new[]

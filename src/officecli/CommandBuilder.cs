@@ -120,12 +120,16 @@ static partial class CommandBuilder
         rootCommand.Add(serveCommand);
 
         // Register commands from partial files
-        rootCommand.Add(BuildWatchCommand());
+        rootCommand.Add(BuildWatchCommand(jsonOption));
         rootCommand.Add(BuildUnwatchCommand());
-        rootCommand.Add(BuildMarkCommand(jsonOption));
-        rootCommand.Add(BuildUnmarkMarkCommand(jsonOption));
-        rootCommand.Add(BuildGetMarksCommand(jsonOption));
-        rootCommand.Add(BuildGotoCommand(jsonOption));
+        // BC aliases — mark/unmark/get-marks/goto were promoted to `watch <sub>`
+        // subcommands; the top-level forms are kept registered but hidden so
+        // existing scripts and tests keep working. Remove after a deprecation
+        // window once external usage has migrated.
+        var markBc = BuildMarkCommand(jsonOption);          markBc.Hidden = true; rootCommand.Add(markBc);
+        var unmarkBc = BuildUnmarkMarkCommand(jsonOption);  unmarkBc.Hidden = true; rootCommand.Add(unmarkBc);
+        var getMarksBc = BuildGetMarksCommand(jsonOption);  getMarksBc.Hidden = true; rootCommand.Add(getMarksBc);
+        var gotoBc = BuildGotoCommand(jsonOption);          gotoBc.Hidden = true; rootCommand.Add(gotoBc);
         rootCommand.Add(BuildViewCommand(jsonOption));
         rootCommand.Add(BuildGetCommand(jsonOption));
         rootCommand.Add(BuildQueryCommand(jsonOption));
@@ -519,6 +523,12 @@ static partial class CommandBuilder
             {
                 if (string.IsNullOrEmpty(item.Path))
                     throw new ArgumentException("'set' command requires 'path' field. Example: {\"command\": \"set\", \"path\": \"/slide[1]\", \"props\": {\"bold\": \"true\"}}");
+                // Match standalone `set` rejection of empty/missing props — a
+                // batch step with no props is a no-op that previously reported
+                // success, hiding caller mistakes (forgotten props field,
+                // misspelled key promoted to root, etc.).
+                if (props.Count == 0)
+                    throw new ArgumentException("'set' command requires 'props' field with at least one key=value. Got empty/missing props.");
                 var path = item.Path;
                 var unsupported = handler.Set(path, props);
                 // Mirror standalone `set` (CommandBuilder.Set.cs): handler.Set
@@ -634,7 +644,7 @@ static partial class CommandBuilder
                 if (string.IsNullOrEmpty(item.Path))
                     throw new ArgumentException("'remove' command requires 'path' field. Example: {\"command\": \"remove\", \"path\": \"/slide[1]/shape[2]\"}");
                 var path = item.Path;
-                var warning = handler.Remove(path);
+                var warning = handler.Remove(path, item.Props);
                 var msg = $"Removed {path}";
                 if (warning != null) msg += $"\n{warning}";
                 return msg;

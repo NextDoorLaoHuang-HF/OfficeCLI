@@ -74,6 +74,28 @@ internal static class RawXmlHelper
                 prefix, attr.Name.LocalName, ns, attr.Value);
             rootElement.SetAttribute(openXmlAttr);
         }
+        // For each Markup Compatibility extension prefix listed in the
+        // post-mutation `mc:Ignorable` on the root, propagate the matching
+        // xmlns declaration to the SDK root so the prefix-to-URI binding is
+        // visible on the element that carries Ignorable. Without this, strict
+        // consumers (PowerPoint) reject the file even though the SDK serializer
+        // appears to round-trip the inner content — `SetAttribute` skipped
+        // xmlns nodes above and the SDK won't synthesize a declaration for a
+        // prefix it has no typed knowledge of.
+        var ignorableValue = (string?)xDoc.Root.Attribute(McNs + "Ignorable");
+        if (!string.IsNullOrWhiteSpace(ignorableValue))
+        {
+            foreach (var prefix in ignorableValue.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var ns = xDoc.Root.GetNamespaceOfPrefix(prefix);
+                if (ns == null) continue;
+                // Skip if SDK already has it declared (avoid duplicate decl).
+                var existing = rootElement.LookupNamespace(prefix);
+                if (existing == ns.NamespaceName) continue;
+                try { rootElement.AddNamespaceDeclaration(prefix, ns.NamespaceName); }
+                catch (InvalidOperationException) { /* already present under another binding */ }
+            }
+        }
         return affected;
     }
 
@@ -97,14 +119,42 @@ internal static class RawXmlHelper
         var xDoc = XDocument.Parse(sourceXml);
         var nsManager = BuildNamespaceManager(xDoc);
 
+        // Validate action before evaluating xpath so an unknown action is
+        // never masked by a no-match xpath. Without this, a typo'd action
+        // combined with a stale xpath would batch-report "OK" while doing
+        // nothing — the user sees no signal that the action name was wrong.
+        var normalizedAction = action.ToLowerInvariant();
+        switch (normalizedAction)
+        {
+            case "append":
+            case "prepend":
+            case "insertbefore":
+            case "before":
+            case "insertafter":
+            case "after":
+            case "replace":
+            case "remove":
+            case "delete":
+            case "setattr":
+                break;
+            default:
+                throw new ArgumentException($"Unknown action: {action}. Supported: append, prepend, insertbefore, insertafter, replace, remove, setattr");
+        }
+
         var nodes = xDoc.XPathSelectElements(xpath, nsManager).ToList();
         if (nodes.Count == 0)
         {
-            Console.Error.WriteLine($"raw-set: XPath matched no elements: {xpath}");
-            Console.Error.WriteLine("Hint: auto-registered namespace prefixes: " +
+            // Throw rather than return 0 affected with a stderr nudge: the
+            // stderr line is trivially dropped by pipelines and batch
+            // envelopes, leaving callers with success:true on a no-op. A
+            // typo'd xpath then looks indistinguishable from a real
+            // mutation. Surface the failure where every consumer
+            // (standalone, batch, resident) already handles exceptions.
+            throw new ArgumentException(
+                $"raw-set: XPath matched no elements: {xpath}. " +
+                "Hint: auto-registered namespace prefixes: " +
                 string.Join(", ", CommonNamespaces.Keys.Order()) +
                 ". No xmlns declarations needed in --xml fragments.");
-            return (xDoc, 0);
         }
 
         int affected = 0;
@@ -188,7 +238,155 @@ internal static class RawXmlHelper
             }
         }
 
+        // mc:AlternateContent / mc:Choice fragments injected via raw-set carry
+        // their own inline `xmlns:mc` and `xmlns:<ext>` declarations, but the
+        // Markup Compatibility spec (ECMA-376 Part 3) requires every extension
+        // prefix referenced by `mc:Choice/@Requires` to also be listed in an
+        // ancestor `mc:Ignorable` attribute. Without it, strict consumers
+        // (PowerPoint, Word strict mode) reject the file at load time even
+        // though the SDK validator passes. PowerPoint's own files always
+        // declare e.g. `mc:Ignorable="p159"` on <p:sld>; replay-from-dump must
+        // mirror this. Sweep the post-mutation tree for any `mc:Choice@Requires`
+        // and merge the prefixes into the root's mc:Ignorable (de-duplicated).
+        EnsureMcIgnorableForChoiceRequires(xDoc);
+
+        // Schema-order known well-known containers whose children land in a
+        // fixed sequence. Raw-set callers (notably the pptx dump replay for
+        // exotic transition/timing) emit an `append` on the parent without
+        // knowing the replay-time sibling state — a later-emitted
+        // `<p:transition>` would otherwise sit AFTER an earlier semantically
+        // added `<p:timing>`, which strict consumers reject. The reorder is
+        // a no-op when children are already in spec order, so existing
+        // raw-set callers stay byte-stable.
+        EnforceKnownSchemaOrder(xDoc);
+
         return (xDoc, affected);
+    }
+
+    // Map (parent-namespace, parent-localName) → ordered list of expected
+    // child local names. Only well-known containers whose children are
+    // affected by raw-set `append` callers; expand as new dump-replay paths
+    // surface drift. Children whose localName is not in the list are kept in
+    // their existing relative position at the tail.
+    private static readonly Dictionary<(string ns, string name), string[]> SchemaOrderMap =
+        new()
+        {
+            // p:sld — ECMA-376 CT_Slide
+            [("http://schemas.openxmlformats.org/presentationml/2006/main", "sld")] =
+                new[] { "cSld", "clrMapOvr", "transition", "timing", "extLst" },
+            // p:sldLayout — CT_SlideLayout
+            [("http://schemas.openxmlformats.org/presentationml/2006/main", "sldLayout")] =
+                new[] { "cSld", "clrMapOvr", "transition", "timing", "hf", "extLst" },
+            // p:sldMaster — CT_SlideMaster
+            [("http://schemas.openxmlformats.org/presentationml/2006/main", "sldMaster")] =
+                new[] { "cSld", "clrMap", "sldLayoutIdLst", "transition", "timing", "hf", "txStyles", "extLst" },
+        };
+
+    private static void EnforceKnownSchemaOrder(XDocument xDoc)
+    {
+        if (xDoc.Root == null) return;
+        // Apply to the document root and any nested matches (cheap walk).
+        foreach (var el in xDoc.Descendants().Prepend(xDoc.Root))
+        {
+            if (!SchemaOrderMap.TryGetValue((el.Name.NamespaceName, el.Name.LocalName), out var order))
+                continue;
+            var children = el.Elements().ToList();
+            // Order index for known names; unknown children sort last in
+            // their current order (preserves source order for unknowns —
+            // mc:AlternateContent wrappers carrying transition/timing live
+            // under a different localName so they fall here, but they
+            // were already placed by the caller).
+            int IndexOf(XElement c)
+            {
+                // mc:AlternateContent that wraps a transition or timing
+                // should sort to the slot of the wrapped element.
+                if (c.Name.LocalName == "AlternateContent" &&
+                    c.Name.NamespaceName == McNs.NamespaceName)
+                {
+                    foreach (var nested in c.Descendants())
+                    {
+                        var idx = Array.IndexOf(order, nested.Name.LocalName);
+                        if (idx >= 0) return idx;
+                    }
+                }
+                var i = Array.IndexOf(order, c.Name.LocalName);
+                return i >= 0 ? i : order.Length;
+            }
+            // Stable sort by schema order, preserving source order within ties.
+            var indexed = children.Select((c, i) => (child: c, slot: IndexOf(c), origIdx: i))
+                .OrderBy(t => t.slot).ThenBy(t => t.origIdx).ToList();
+            // Skip work if already in order.
+            bool needsReorder = false;
+            for (int i = 0; i < children.Count; i++)
+            {
+                if (!ReferenceEquals(children[i], indexed[i].child)) { needsReorder = true; break; }
+            }
+            if (!needsReorder) continue;
+            foreach (var c in children) c.Remove();
+            foreach (var t in indexed) el.Add(t.child);
+        }
+    }
+
+    private static readonly XNamespace McNs =
+        "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+    private static void EnsureMcIgnorableForChoiceRequires(XDocument xDoc)
+    {
+        var root = xDoc.Root;
+        if (root == null) return;
+
+        // Collect every prefix listed in mc:Choice/@Requires (whitespace-separated).
+        // Spec: Requires may name multiple prefixes; treat each token independently.
+        var required = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var choice in root.Descendants(McNs + "Choice"))
+        {
+            var req = (string?)choice.Attribute("Requires");
+            if (string.IsNullOrWhiteSpace(req)) continue;
+            foreach (var token in req.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+                required.Add(token);
+        }
+        if (required.Count == 0) return;
+
+        // For each required prefix, the extension namespace declaration must be
+        // visible in the document. Inline `xmlns:p159="..."` on the descendant
+        // `<p:transition>` is in-scope for the Choice but is NOT what makes
+        // mc:Ignorable lookup valid — strict consumers want the prefix-to-uri
+        // binding resolvable from the element that *carries* mc:Ignorable.
+        // Copy any inline declaration of that prefix up to the root if missing.
+        foreach (var prefix in required)
+        {
+            if (root.GetNamespaceOfPrefix(prefix) != null) continue;
+            // Walk descendants for the first inline declaration of this prefix.
+            var declared = root.Descendants()
+                .SelectMany(e => e.Attributes())
+                .FirstOrDefault(a => a.IsNamespaceDeclaration && a.Name.LocalName == prefix);
+            if (declared != null)
+                root.SetAttributeValue(XNamespace.Xmlns + prefix, declared.Value);
+        }
+
+        // Ensure mc namespace itself is declared on the root so the Ignorable
+        // attribute name binds correctly.
+        if (root.GetPrefixOfNamespace(McNs) == null)
+            root.SetAttributeValue(XNamespace.Xmlns + "mc", McNs.NamespaceName);
+
+        // Merge required prefixes into mc:Ignorable, preserving any pre-existing
+        // tokens and de-duplicating. Stable token order: existing first, new appended.
+        var ignorableAttr = root.Attribute(McNs + "Ignorable");
+        var existing = (ignorableAttr?.Value ?? string.Empty)
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .ToList();
+        var existingSet = new HashSet<string>(existing, StringComparer.Ordinal);
+        var changed = false;
+        foreach (var prefix in required)
+        {
+            if (existingSet.Add(prefix))
+            {
+                existing.Add(prefix);
+                changed = true;
+            }
+        }
+        if (changed || ignorableAttr == null)
+            root.SetAttributeValue(McNs + "Ignorable", string.Join(" ", existing));
     }
 
     private static readonly Dictionary<string, string> CommonNamespaces = new()

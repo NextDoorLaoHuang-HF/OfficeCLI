@@ -12,6 +12,9 @@ public partial class WordHandler
 {
     private string AddParagraph(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
     {
+        // See RejectBareRevisionKey: the bare `revision=` literal was retired
+        // when creation/action split into revision.type / revision.action.
+        RejectBareRevisionKey(properties);
         string resultPath;
         var para = new Paragraph();
         AssignParaId(para);
@@ -888,11 +891,14 @@ public partial class WordHandler
             // round-trips fine on `set r[N] kern=36`. Removed so kern reaches
             // ApplyRunFormatting on the bare-key fallback path below.
             // v5.9: paragraph-level format-revision marker keys consumed
-            // by the pPrChange block at the end of AddParagraph.
-            "trackChange", "trackchange",
-            "trackChange.author", "trackchange.author",
-            "trackChange.date",   "trackchange.date",
-            "trackChange.id",     "trackchange.id",
+            // by the pPrChange block at the end of AddParagraph. The bare
+            // `revision` key is intentionally absent — creation uses
+            // `revision.type=<kind>`, action uses `revision.action=accept|reject`;
+            // a bare `revision` literal is an error (no silent allowlist).
+            "revision.type",
+            "revision.author",
+            "revision.date",
+            "revision.id",
         };
         foreach (var (key, value) in properties)
         {
@@ -941,10 +947,9 @@ public partial class WordHandler
             }
             if (key.StartsWith("pbdr", StringComparison.OrdinalIgnoreCase)) continue;
             if (!key.Contains('.') && bareConsumed.Contains(key)) continue;
-            // v5.9: trackChange.author / trackChange.date / trackChange.id —
-            // consumed by AddParagraph's pPrChange block at end-of-function.
-            if (key.StartsWith("trackChange.", StringComparison.OrdinalIgnoreCase)
-                || key.StartsWith("trackchange.", StringComparison.OrdinalIgnoreCase))
+            // revision.author / revision.date / revision.id — consumed by
+            // AddParagraph's pPrChange block at end-of-function.
+            if (key.StartsWith("revision.", StringComparison.OrdinalIgnoreCase))
                 continue;
             if (!key.Contains('.'))
             {
@@ -1090,33 +1095,87 @@ public partial class WordHandler
             pProps.BiDi = new BiDi { Val = new DocumentFormat.OpenXml.OnOffValue(false) };
         }
 
-        // v5.9: paragraph-level trackChange=format → <w:pPrChange>.
+        // Paragraph-level `revision.type=format` → <w:pPrChange>.
         // Mirrors the run-side rPrChange path in AddRun. .doc carries
         // sprmPPropRMark (0xC63F); we stamp the marker with optional
         // author/date/id and leave the inner pPr empty (no recoverable
         // prior-property snapshot at v1).
-        if ((properties.TryGetValue("trackChange", out var pTcKind)
-             || properties.TryGetValue("trackchange", out pTcKind))
-            && pTcKind?.Trim().ToLowerInvariant() == "format")
+        string? pTcKind = null;
+        properties.TryGetValue("revision.type", out pTcKind);
+        if (pTcKind?.Trim().ToLowerInvariant() == "format")
         {
             string? pTcAuthor = null;
             string? pTcDate = null;
             string? pTcId = null;
-            properties.TryGetValue("trackChange.author", out pTcAuthor);
-            if (pTcAuthor == null) properties.TryGetValue("trackchange.author", out pTcAuthor);
-            properties.TryGetValue("trackChange.date", out pTcDate);
-            if (pTcDate == null) properties.TryGetValue("trackchange.date", out pTcDate);
-            properties.TryGetValue("trackChange.id", out pTcId);
-            if (pTcId == null) properties.TryGetValue("trackchange.id", out pTcId);
+            properties.TryGetValue("revision.author", out pTcAuthor);
+            properties.TryGetValue("revision.date", out pTcDate);
+            properties.TryGetValue("revision.id", out pTcId);
             var pprChange = new ParagraphPropertiesChange();
             if (!string.IsNullOrEmpty(pTcAuthor)) pprChange.Author = pTcAuthor;
             if (!string.IsNullOrEmpty(pTcDate) && DateTime.TryParse(pTcDate, out var pTcDt))
                 pprChange.Date = pTcDt;
             pprChange.Id = !string.IsNullOrEmpty(pTcId)
                 ? pTcId
-                : (GenerateParaId().GetHashCode() & 0x7FFFFFFF).ToString();
+                : GenerateRevisionId();
             pprChange.AppendChild(new PreviousParagraphProperties());
             pProps.AppendChild(pprChange);
+        }
+
+        // High-level paragraph-insertion revision: ANY revision.* sub-key
+        // (author/date/id) WITHOUT a `revision.type=<kind>` literal means "this
+        // paragraph was just inserted as a tracked change". Mirrors the
+        // equivalent in AddRun (Phase 1) and the inverse in Mutations.Remove
+        // (Phase 4: remove paragraph + revision.author produces ¶ del +
+        // content del wrappers).
+        //
+        // Word UI semantic: pressing Enter in revision mode inserts a new
+        // paragraph and marks BOTH the new ¶ AND any typed content as ins.
+        // We emit:
+        //   1. <w:pPr><w:rPr><w:ins .../></w:rPr></w:pPr>  — ¶ mark
+        //   2. <w:ins><w:r>...</w:r></w:ins>               — content wrapper
+        //      (only when --prop text=... auto-created an inner run)
+        // Each gets a distinct auto-allocated revision id sharing the same
+        // author + date — accept-all sees them as related but independent.
+        if (string.IsNullOrEmpty(pTcKind))
+        {
+            string? hTcAuthor = null, hTcDate = null, hTcId = null;
+            properties.TryGetValue("revision.author", out hTcAuthor);
+            properties.TryGetValue("revision.date", out hTcDate);
+            properties.TryGetValue("revision.id", out hTcId);
+
+            if (!string.IsNullOrEmpty(hTcAuthor) || !string.IsNullOrEmpty(hTcDate) || !string.IsNullOrEmpty(hTcId))
+            {
+                var author = string.IsNullOrEmpty(hTcAuthor) ? "OfficeCLI" : hTcAuthor!;
+                DateTime date = !string.IsNullOrEmpty(hTcDate) && DateTime.TryParse(hTcDate, out var hd)
+                    ? hd : DateTime.UtcNow;
+                // ¶ mark: <w:pPr><w:rPr><w:ins/></w:rPr></w:pPr>
+                var pMarkRPr = pProps.ParagraphMarkRunProperties
+                              ?? pProps.PrependChild(new ParagraphMarkRunProperties());
+                pMarkRPr.AppendChild(new Inserted
+                {
+                    Author = author,
+                    Date = date,
+                    Id = !string.IsNullOrEmpty(hTcId) ? hTcId : GenerateRevisionId(),
+                });
+
+                // Content: wrap each direct-child Run that was auto-created
+                // from --prop text=... (paragraph-level text/html/sym) in
+                // <w:ins>. Skip Runs that are already inside an ins/del/move
+                // wrapper. Each wrapper gets its own auto-allocated id when
+                // hTcId was not explicit (otherwise reuse it for the ¶ mark
+                // only, per the Phase 4 remove-paragraph convention).
+                foreach (var r in para.Elements<Run>().ToList())
+                {
+                    var ins = new InsertedRun
+                    {
+                        Author = author,
+                        Date = date,
+                        Id = GenerateRevisionId(),
+                    };
+                    para.ReplaceChild(ins, r);
+                    ins.AppendChild(r);
+                }
+            }
         }
         return resultPath;
     }
@@ -1306,6 +1365,9 @@ public partial class WordHandler
 
     private string AddRun(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
     {
+        // See RejectBareRevisionKey: the bare `revision=` literal was retired
+        // when creation/action split into revision.type / revision.action.
+        RejectBareRevisionKey(properties);
         string resultPath;
         // BUG-DUMP33-01: support <w:hyperlink> as a run parent so dump→batch
         // can round-trip tab-only / formatted runs that live inside a
@@ -1321,26 +1383,38 @@ public partial class WordHandler
         if (targetPara == null)
             throw new ArgumentException("Runs can only be added to paragraphs");
 
-        // BUG-DUMP5-10: track-change attribution from dump round-trip.
-        // WordBatchEmitter emits trackChange / trackChange.author /
-        // trackChange.date on the run when the source run sat inside a
-        // <w:ins>/<w:del> wrapper. Without consuming these here, the dotted
-        // fallback below dispatches them through TypedAttributeFallback.TrySet
-        // — which has no rPr attribute to bind them to — and they're marked
-        // UNSUPPORTED, dropping the wrapper entirely on replay.
+        // BUG-DUMP5-10: revision attribution from dump round-trip.
+        // WordBatchEmitter emits revision / revision.author / revision.date
+        // on the run when the source run sat inside a <w:ins>/<w:del>
+        // wrapper. Without consuming these here, the dotted fallback below
+        // dispatches them through TypedAttributeFallback.TrySet — which has
+        // no rPr attribute to bind them to — and they're marked UNSUPPORTED,
+        // dropping the wrapper entirely on replay.
         string? trackChangeKind = null;
         string? trackChangeAuthor = null;
         string? trackChangeDate = null;
         string? trackChangeId = null;
-        if (properties.TryGetValue("trackChange", out var tcKindRaw)
-            || properties.TryGetValue("trackchange", out tcKindRaw))
+        if (properties.TryGetValue("revision.type", out var tcKindRaw))
             trackChangeKind = tcKindRaw?.Trim().ToLowerInvariant();
-        properties.TryGetValue("trackChange.author", out trackChangeAuthor);
-        if (trackChangeAuthor == null) properties.TryGetValue("trackchange.author", out trackChangeAuthor);
-        properties.TryGetValue("trackChange.date", out trackChangeDate);
-        if (trackChangeDate == null) properties.TryGetValue("trackchange.date", out trackChangeDate);
-        properties.TryGetValue("trackChange.id", out trackChangeId);
-        if (trackChangeId == null) properties.TryGetValue("trackchange.id", out trackChangeId);
+        properties.TryGetValue("revision.author", out trackChangeAuthor);
+        properties.TryGetValue("revision.date", out trackChangeDate);
+        properties.TryGetValue("revision.id", out trackChangeId);
+
+        // High-level inference: if a revision.* sub-key is present
+        // (author/date/id) without an explicit `revision.type=<kind>` literal,
+        // default to "ins" — `add run + revision.author=X` means "create a
+        // new run as a tracked insertion". Mirrors Word UI: any edit while
+        // track-changes is on becomes a revision; for an `add run` op the
+        // only natural revision kind is insertion. Format / moveFrom /
+        // moveTo still require the explicit literal because they're not
+        // implied by `add`.
+        if (string.IsNullOrEmpty(trackChangeKind)
+            && (!string.IsNullOrEmpty(trackChangeAuthor)
+                || !string.IsNullOrEmpty(trackChangeDate)
+                || !string.IsNullOrEmpty(trackChangeId)))
+        {
+            trackChangeKind = "ins";
+        }
 
         var newRun = new Run();
         var newRProps = new RunProperties();
@@ -1671,8 +1745,10 @@ public partial class WordHandler
             "textoutline", "textfill", "w14shadow", "w14glow", "w14reflection",
             "field", "formula", "ref", "id",
             // BUG-DUMP5-10: consumed up-front for the w:ins/w:del wrapper
-            // emit at the bottom of this method.
-            "trackchange",
+            // emit at the bottom of this method. Bare `revision` is no
+            // longer a valid key — creation = `revision.type`, action =
+            // `revision.action`.
+            "revision.type",
             // BUG-DUMP7-01: consumed up-front to emit <w:sym/> in place of <w:t>.
             "sym",
             // CONSISTENCY(markRPr-inherit-opt-out): consumed up-front (line ~1587)
@@ -1748,9 +1824,9 @@ public partial class WordHandler
                 case "sizecs":
                 // BUG-DUMP5-10: consumed up-front for the w:ins/w:del
                 // wrapper emit at the bottom of this method.
-                case "trackchange.author":
-                case "trackchange.date":
-                case "trackchange.id":
+                case "revision.author":
+                case "revision.date":
+                case "revision.id":
                     continue;
             }
             // CONSISTENCY(add-set-symmetry / bcp47-validation): route lang.*
@@ -1862,7 +1938,7 @@ public partial class WordHandler
                 rprChange.Date = tcfDate;
             rprChange.Id = !string.IsNullOrEmpty(trackChangeId)
                 ? trackChangeId
-                : (GenerateParaId().GetHashCode() & 0x7FFFFFFF).ToString();
+                : GenerateRevisionId();
             // Schema: w:rPrChange child of w:rPr; ECMA-376 §17.13.5.31.
             // Empty inner rPr is schema-valid (means "no recorded prior
             // property set" — minimal marker form).
@@ -1895,9 +1971,10 @@ public partial class WordHandler
                 }
                 else
                 {
-                    // Each ins/del needs a unique w:id. Reuse the paraId
-                    // counter to avoid colliding with anything Word writes.
-                    var fallbackId = (GenerateParaId().GetHashCode() & 0x7FFFFFFF).ToString();
+                    // Each ins/del needs a unique w:id. Allocated from the
+                    // shared paraId pool (decimal form), guaranteed unique
+                    // against all paraId/textId/revision ids in the document.
+                    var fallbackId = GenerateRevisionId();
                     if (wrapper is InsertedRun insW4) insW4.Id = fallbackId;
                     else if (wrapper is DeletedRun delW4) delW4.Id = fallbackId;
                 }
@@ -1912,6 +1989,51 @@ public partial class WordHandler
                         t.Parent?.ReplaceChild(dt, t);
                     }
                 }
+                parentEl.ReplaceChild(wrapper, newRun);
+                wrapper.AppendChild(newRun);
+            }
+        }
+        // moveFrom / moveTo: low-level OOXML synthesis primitives for
+        // dump/replay round-trip. The two sides MUST share the same w:id +
+        // w:author + w:date to be recognised as a single move operation by
+        // Word — across two independent `add run` calls the CLI cannot infer
+        // which pair the caller means, so trackChange.id is REQUIRED here.
+        // (For interactive authoring the high-level shape would be a single
+        // compound `word move` command that emits both sides atomically.)
+        if (trackChangeKind == "movefrom" || trackChangeKind == "moveto")
+        {
+            if (string.IsNullOrEmpty(trackChangeId))
+                throw new InvalidOperationException(
+                    $"revision.type={trackChangeKind} requires an explicit revision.id; "
+                    + "moveFrom and moveTo must share the same id to be recognised as a "
+                    + "pair by Word. Pass --prop revision.id=<n> on both sides.");
+
+            var parentEl = newRun.Parent;
+            if (parentEl != null)
+            {
+                OpenXmlElement wrapper = trackChangeKind == "movefrom"
+                    ? new MoveFromRun()
+                    : new MoveToRun();
+                if (!string.IsNullOrEmpty(trackChangeAuthor))
+                {
+                    if (wrapper is MoveFromRun mfA) mfA.Author = trackChangeAuthor;
+                    else if (wrapper is MoveToRun mtA) mtA.Author = trackChangeAuthor;
+                }
+                if (!string.IsNullOrEmpty(trackChangeDate)
+                    && DateTime.TryParse(trackChangeDate, out var mvDate))
+                {
+                    if (wrapper is MoveFromRun mfD) mfD.Date = mvDate;
+                    else if (wrapper is MoveToRun mtD) mtD.Date = mvDate;
+                }
+                if (wrapper is MoveFromRun mfI) mfI.Id = trackChangeId;
+                else if (wrapper is MoveToRun mtI) mtI.Id = trackChangeId;
+                // Both moveFrom and moveTo keep w:t. Per ECMA-376 §17.3.3.34,
+                // w:delText is only valid inside <w:del> (never inside
+                // <w:moveFrom>) — Word's strikethrough rendering for moveFrom
+                // content comes from the moveFrom wrapper, not from delText.
+                // Previously we converted t→delText inside moveFrom, which
+                // tripped Word's "found unreadable content" recovery on open
+                // (it re-wraps the orphan delText in a synthetic <w:del>).
                 parentEl.ReplaceChild(wrapper, newRun);
                 wrapper.AppendChild(newRun);
             }

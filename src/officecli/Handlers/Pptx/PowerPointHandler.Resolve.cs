@@ -46,7 +46,7 @@ public partial class PowerPointHandler
 
         var shapes = shapeTree.Elements<Shape>().ToList();
         if (shapeIdx < 1 || shapeIdx > shapes.Count)
-            throw new ArgumentException($"Shape {shapeIdx} not found");
+            throw new ArgumentException($"Shape {shapeIdx} not found (total: {shapes.Count})");
 
         return (slidePart, shapes[shapeIdx - 1]);
     }
@@ -354,7 +354,40 @@ public partial class PowerPointHandler
                     newShape.TextBody.Append(new Drawing.Paragraph(
                         new Drawing.EndParagraphRunProperties { Language = "en-US" }));
                 }
-                shapeTree.AppendChild(newShape);
+                // Insert in layout-defined phType order so spTree z-order is a
+                // function of the layout, not the user's set-order. OOXML spTree
+                // order == z-order; appending blindly let "set title then body"
+                // and "set body then title" produce different z-stacking on the
+                // same final state. Anchor: the last already-materialized
+                // placeholder whose layout-rank precedes newShape's; if none,
+                // insert at the head.
+                var layoutOrder = layoutPart.SlideLayout.CommonSlideData.ShapeTree
+                    .Elements<Shape>()
+                    .Select(s => s.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
+                        ?.GetFirstChild<PlaceholderShape>()?.Type?.Value)
+                    .Where(t => t != null)
+                    .Select(t => t!.Value)
+                    .ToList();
+                int newRank = layoutOrder.IndexOf(phType);
+                Shape? anchor = null;
+                if (newRank >= 0)
+                {
+                    foreach (var existing in shapeTree.Elements<Shape>())
+                    {
+                        var t = existing.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
+                            ?.GetFirstChild<PlaceholderShape>()?.Type?.Value;
+                        if (t == null) continue;
+                        int r = layoutOrder.IndexOf(t.Value);
+                        if (r >= 0 && r < newRank) anchor = existing;
+                    }
+                }
+                if (anchor != null) anchor.InsertAfterSelf(newShape);
+                else
+                {
+                    var first = shapeTree.Elements<Shape>().FirstOrDefault();
+                    if (first != null) first.InsertBeforeSelf(newShape);
+                    else shapeTree.AppendChild(newShape);
+                }
                 return newShape;
             }
         }
@@ -380,11 +413,24 @@ public partial class PowerPointHandler
             .GetFirstChild<PlaceholderShape>()!;
 
         var node = ShapeToNode(shape, slideIdx, phIdx, depth);
-        node.Path = $"/slide[{slideIdx}]/placeholder[{phIdx}]";
+        var phPath = $"/slide[{slideIdx}]/placeholder[{phIdx}]";
+        RebaseDescendantPaths(node, node.Path, phPath);
+        node.Path = phPath;
         node.Type = "placeholder";
         if (ph.Type?.HasValue == true) node.Format["phType"] = ph.Type.InnerText;
         if (ph.Index?.HasValue == true) node.Format["phIndex"] = ph.Index.Value;
         return node;
+    }
+
+    private static void RebaseDescendantPaths(DocumentNode node, string oldPrefix, string newPrefix)
+    {
+        if (oldPrefix == newPrefix) return;
+        foreach (var child in node.Children)
+        {
+            if (child.Path.StartsWith(oldPrefix, StringComparison.Ordinal))
+                child.Path = newPrefix + child.Path.Substring(oldPrefix.Length);
+            RebaseDescendantPaths(child, oldPrefix, newPrefix);
+        }
     }
 
     // ==================== Media Timing Lookup ====================
@@ -406,12 +452,12 @@ public partial class PowerPointHandler
         return null;
     }
 
-    // ==================== Cleanup (POI-style reference counting) ====================
+    // ==================== Cleanup (reference counting) ====================
 
     /// <summary>
     /// Remove a Picture element with proper cleanup of relationships and media parts.
-    /// Follows Apache POI's pattern: reference-count blipIds, only delete parts when
-    /// no other shapes reference the same media.
+    /// Reference-counts blipIds — only deletes parts when no other shapes reference
+    /// the same media.
     /// </summary>
     private static void RemovePictureWithCleanup(SlidePart slidePart, ShapeTree shapeTree, Picture pic)
     {

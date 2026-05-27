@@ -78,7 +78,7 @@ public partial class ExcelHandler
                     case "category": pkg.Category = value; break;
                     case "keywords": pkg.Keywords = value; break;
                     case "lastmodifiedby": pkg.LastModifiedBy = value; break;
-                    case "revision": pkg.Revision = value; break;
+                    case "revisionnumber": pkg.Revision = value; break;
                     default:
                         var lowerKey = key.ToLowerInvariant();
                         if (!TrySetWorkbookSetting(lowerKey, value)
@@ -1143,7 +1143,7 @@ public partial class ExcelHandler
                 }
                 case "autofilter":
                 {
-                    // Set or remove AutoFilter (like POI's XSSFSheet.setAutoFilter)
+                    // Set or remove AutoFilter
                     var existingAf = ws.GetFirstChild<AutoFilter>();
                     var trimmed = (value ?? "").Trim();
                     var lower = trimmed.ToLowerInvariant();

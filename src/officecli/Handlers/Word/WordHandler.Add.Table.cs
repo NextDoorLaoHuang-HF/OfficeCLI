@@ -25,16 +25,35 @@ public partial class WordHandler
         // expected partial-override semantics. To express a genuine three-line
         // table (top/bottom only), pass border=none first to wipe defaults,
         // then border.top + border.bottom. CONSISTENCY(border-default-overlay).
-        TableProperties tblProps = new TableProperties(
-            new TableBorders(
-                new TopBorder { Val = BorderValues.Single, Size = 4 },
-                new LeftBorder { Val = BorderValues.Single, Size = 4 },
-                new BottomBorder { Val = BorderValues.Single, Size = 4 },
-                new RightBorder { Val = BorderValues.Single, Size = 4 },
-                new InsideHorizontalBorder { Val = BorderValues.Single, Size = 4 },
-                new InsideVerticalBorder { Val = BorderValues.Single, Size = 4 }
-            )
-        );
+        //
+        // `skipDefaultBorders=true` (dump→batch D1 round-trip; see
+        // WordBatchEmitter.Table.cs) suppresses the seed so a follow-up
+        // `set tbl --prop border=...` can snapshot a bare tblPr as the
+        // tblPrChange "before" state — without this, the seeded borders
+        // would already match the source's borders and the set's snapshot
+        // would equal the current state, hiding the revision from Word's
+        // reviewing pane.
+        bool skipDefaultBorders =
+            (properties.TryGetValue("skipDefaultBorders", out var sdbA) && IsTruthy(sdbA))
+            || (properties.TryGetValue("skipdefaultborders", out var sdbB) && IsTruthy(sdbB));
+        TableProperties tblProps;
+        if (skipDefaultBorders)
+        {
+            tblProps = new TableProperties();
+        }
+        else
+        {
+            tblProps = new TableProperties(
+                new TableBorders(
+                    new TopBorder { Val = BorderValues.Single, Size = 4 },
+                    new LeftBorder { Val = BorderValues.Single, Size = 4 },
+                    new BottomBorder { Val = BorderValues.Single, Size = 4 },
+                    new RightBorder { Val = BorderValues.Single, Size = 4 },
+                    new InsideHorizontalBorder { Val = BorderValues.Single, Size = 4 },
+                    new InsideVerticalBorder { Val = BorderValues.Single, Size = 4 }
+                )
+            );
+        }
         table.AppendChild(tblProps);
         // Apply user-supplied border.* props in order; "border" / "border.all"
         // (with value "none") wipes defaults before per-side props overlay.
@@ -545,6 +564,17 @@ public partial class WordHandler
         return $"{parentPath}/tbl[{(idx >= 0 ? idx + 1 : tbls.Count)}]";
     }
 
+    /// <summary>True when properties carries any trackChange.* sub-key.</summary>
+    private static bool HasRowTrackChangeProps(Dictionary<string, string> properties)
+    {
+        foreach (var k in properties.Keys)
+        {
+            if (k.StartsWith("revision.", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     private string AddRow(OpenXmlElement parent, string parentPath, int? index, Dictionary<string, string> properties)
     {
         if (parent is not Table targetTable)
@@ -654,6 +684,42 @@ public partial class WordHandler
             LastAddUnsupportedProps.Add(key);
         }
 
+        // High-level row-insertion revision: any trackChange.* sub-key (author/
+        // date/id) marks the newly-added row as inserted by placing a bare
+        // <w:ins/> marker inside <w:trPr>. Mirrors the `add run + trackChange.*
+        // → <w:ins> wrapper` pattern (Phase 1) but uses OOXML's row-level
+        // marker-in-Pr form rather than a wrapper.
+        //
+        // KNOWN LIMITATION (A-route boundary): we do NOT cascade by wrapping
+        // every cell's inner run in <w:ins> too. Word UI requires the cascade
+        // to display the row as "newly inserted" visually; without it the row
+        // appears unmarked in Word even though accept-all / reject-all still
+        // identify it as a revision. Authoring a fully-rendered row insertion
+        // is out of CLI scope — use Word directly. The trPr/ins marker remains
+        // useful for: programmatic accept/reject, query revision, and
+        // round-trip preservation.
+        if (HasRowTrackChangeProps(properties))
+        {
+            string? rowTcAuthor = null, rowTcDate = null, rowTcId = null;
+            properties.TryGetValue("revision.author", out rowTcAuthor);
+            properties.TryGetValue("revision.date", out rowTcDate);
+            properties.TryGetValue("revision.id", out rowTcId);
+
+            newRowProps ??= newRow.PrependChild(new TableRowProperties());
+            var marker = new Inserted
+            {
+                Author = string.IsNullOrEmpty(rowTcAuthor) ? "OfficeCLI" : rowTcAuthor,
+                Date = !string.IsNullOrEmpty(rowTcDate) && DateTime.TryParse(rowTcDate, out var rowD)
+                    ? rowD : DateTime.UtcNow,
+                Id = !string.IsNullOrEmpty(rowTcId) ? rowTcId : GenerateRevisionId(),
+            };
+            newRowProps.AppendChild(marker);
+
+            // Remove trackChange.* from unsupported list (consumed).
+            LastAddUnsupportedProps.RemoveAll(k =>
+                k.StartsWith("revision.", StringComparison.OrdinalIgnoreCase));
+        }
+
         if (index.HasValue)
         {
             var existingRows = targetTable.Elements<TableRow>().ToList();
@@ -720,6 +786,26 @@ public partial class WordHandler
             grid.AppendChild(newGridCol);
 
         var cellText = properties.GetValueOrDefault("text", "");
+
+        // Phase 6: virtual-column insertion revision. trackChange.* sub-keys
+        // mark every newly-inserted cell with <w:tcPr><w:cellIns/></w:tcPr>.
+        // The N cells produced (one per existing row) is the column op's
+        // natural output — NOT a cascade into pre-existing content. All
+        // cellIns markers share author/date but get distinct auto-allocated
+        // ids (no explicit trackChange.id support across N cells — it would
+        // be ambiguous).
+        bool colHasTc = HasRowTrackChangeProps(properties);
+        string colTcAuthor = "OfficeCLI";
+        DateTime colTcDate = DateTime.UtcNow;
+        if (colHasTc)
+        {
+            properties.TryGetValue("revision.author", out var aRaw);
+            if (!string.IsNullOrEmpty(aRaw)) colTcAuthor = aRaw;
+            properties.TryGetValue("revision.date", out var dRaw);
+            if (!string.IsNullOrEmpty(dRaw) && DateTime.TryParse(dRaw, out var parsed))
+                colTcDate = parsed;
+        }
+
         foreach (var row in targetTable.Elements<TableRow>())
         {
             var newPara = new Paragraph();
@@ -728,12 +814,27 @@ public partial class WordHandler
                 newPara.AppendChild(new Run(new Text(cellText) { Space = SpaceProcessingModeValues.Preserve }));
             var newCell = new TableCell(newPara);
 
+            if (colHasTc)
+            {
+                var tcPr = newCell.PrependChild(new TableCellProperties());
+                tcPr.AppendChild(new CellInsertion
+                {
+                    Author = colTcAuthor,
+                    Date = colTcDate,
+                    Id = GenerateRevisionId(),
+                });
+            }
+
             var cells = row.Elements<TableCell>().ToList();
             if (insertIdx < cells.Count)
                 row.InsertBefore(newCell, cells[insertIdx]);
             else
                 row.AppendChild(newCell);
         }
+
+        if (colHasTc)
+            LastAddUnsupportedProps.RemoveAll(k =>
+                k.StartsWith("revision.", StringComparison.OrdinalIgnoreCase));
 
         var newColIdx = grid.Elements<GridColumn>().ToList().IndexOf(newGridCol) + 1;
         return $"{parentPath}/col[{newColIdx}]";
@@ -994,6 +1095,29 @@ public partial class WordHandler
                 continue;
             }
             LastAddUnsupportedProps.Add(key);
+        }
+
+        // Phase 6: cell-insertion revision. Any trackChange.* sub-key marks
+        // the newly-added cell with <w:tcPr><w:cellIns/></w:tcPr>. Mirrors
+        // `add row + trackChange.author` (which puts <w:ins/> in trPr).
+        if (HasRowTrackChangeProps(properties))  // reuse the row helper
+        {
+            string? cTcAuthor = null, cTcDate = null, cTcId = null;
+            properties.TryGetValue("revision.author", out cTcAuthor);
+            properties.TryGetValue("revision.date", out cTcDate);
+            properties.TryGetValue("revision.id", out cTcId);
+
+            var tcPr = newCell.GetFirstChild<TableCellProperties>()
+                      ?? newCell.PrependChild(new TableCellProperties());
+            tcPr.AppendChild(new CellInsertion
+            {
+                Author = string.IsNullOrEmpty(cTcAuthor) ? "OfficeCLI" : cTcAuthor,
+                Date = !string.IsNullOrEmpty(cTcDate) && DateTime.TryParse(cTcDate, out var cellD)
+                    ? cellD : DateTime.UtcNow,
+                Id = !string.IsNullOrEmpty(cTcId) ? cTcId : GenerateRevisionId(),
+            });
+            LastAddUnsupportedProps.RemoveAll(k =>
+                k.StartsWith("revision.", StringComparison.OrdinalIgnoreCase));
         }
 
         if (index.HasValue)

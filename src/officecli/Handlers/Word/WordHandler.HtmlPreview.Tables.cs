@@ -211,47 +211,21 @@ public partial class WordHandler
             sb.AppendLine("</colgroup>");
         }
 
-        var rows = new List<TableRow>();
+        var rows = table.Elements<TableRow>().ToList();
+        // Also collect rows from revision wrappers (ins/del/moveTo/moveFrom)
         var revisionRowFlags = new Dictionary<TableRow, (string? revisionType, string? author)>();
         foreach (var child in table.ChildElements)
         {
-            if (child is TableRow tr)
-            {
-                rows.Add(tr);
-            }
-            else if (child.LocalName is "ins" or "del" or "moveTo" or "moveFrom")
+            if (child.LocalName is "ins" or "del" or "moveTo" or "moveFrom")
             {
                 var revType = child.LocalName;
                 var revAuthor = child.GetAttributes().FirstOrDefault(a => a.LocalName == "author").Value;
-                // SDK may parse <w:tr> inside revision wrappers as OpenXmlUnknownElement
-                // rather than strong-typed TableRow. Try Descendants<TableRow> first,
-                // then fall back to manual reconstruction from raw XML.
-                var nestedRows = child.Descendants<TableRow>().ToList();
-                if (nestedRows.Count > 0)
+                foreach (var nestedRow in child.Descendants<TableRow>())
                 {
-                    foreach (var nestedRow in nestedRows)
+                    if (!rows.Contains(nestedRow))
                     {
-                        if (!rows.Contains(nestedRow))
-                        {
-                            rows.Add(nestedRow);
-                            revisionRowFlags[nestedRow] = (revType, revAuthor);
-                        }
-                    }
-                }
-                else
-                {
-                    // Fallback: find <w:tr> children parsed as OpenXmlUnknownElement
-                    // and reconstruct them as TableRow via Clone().outerxml
-                    foreach (var maybeRow in child.Elements())
-                    {
-                        if (maybeRow.LocalName == "tr")
-                        {
-                            // Re-parse the outer XML as a TableRow so the rendering
-                            // code (which expects strong-typed properties) works.
-                            var reconstructed = new TableRow(maybeRow.OuterXml);
-                            rows.Add(reconstructed);
-                            revisionRowFlags[reconstructed] = (revType, revAuthor);
-                        }
+                        rows.Add(nestedRow);
+                        revisionRowFlags[nestedRow] = (revType, revAuthor);
                     }
                 }
             }
@@ -631,37 +605,18 @@ public partial class WordHandler
     /// <summary>
     /// Get all TableRow elements from a table, including those nested inside
     /// revision wrappers (w:ins, w:del, w:moveTo, w:moveFrom).
-    /// Handles SDK quirk where rows inside revision wrappers may be parsed
-    /// as OpenXmlUnknownElement rather than strong-typed TableRow.
     /// </summary>
     private static List<TableRow> GetFlattenedTableRows(Table table)
     {
-        var rows = new List<TableRow>();
+        var rows = table.Elements<TableRow>().ToList();
         foreach (var child in table.ChildElements)
         {
-            if (child is TableRow tr)
+            if (child.LocalName is "ins" or "del" or "moveTo" or "moveFrom")
             {
-                rows.Add(tr);
-            }
-            else if (child.LocalName is "ins" or "del" or "moveTo" or "moveFrom")
-            {
-                var nested = child.Descendants<TableRow>().ToList();
-                if (nested.Count > 0)
+                foreach (var nestedRow in child.Descendants<TableRow>())
                 {
-                    foreach (var r in nested)
-                        if (!rows.Contains(r)) rows.Add(r);
-                }
-                else
-                {
-                    foreach (var maybeRow in child.Elements())
-                    {
-                        if (maybeRow.LocalName == "tr")
-                        {
-                            var reconstructed = new TableRow(maybeRow.OuterXml);
-                            if (!rows.Contains(reconstructed))
-                                rows.Add(reconstructed);
-                        }
-                    }
+                    if (!rows.Contains(nestedRow))
+                        rows.Add(nestedRow);
                 }
             }
         }

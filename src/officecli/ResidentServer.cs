@@ -1426,7 +1426,13 @@ public class ResidentServer : IDisposable
         List<BatchItem> items;
         if (_handler is WordHandler word)
         {
-            items = WordBatchEmitter.EmitWord(word, path);
+            var (wItems, wWarnings) = WordBatchEmitter.EmitWordWithWarnings(word, path);
+            items = wItems;
+            // R10-bug1: surface docx dump warnings via stderr so the
+            // envelope-builder in HandleClient picks them up as
+            // envelope.warnings — same wiring as the pptx branch below.
+            foreach (var w in wWarnings)
+                Console.Error.WriteLine($"warning: skipped {w.Element} at {w.Path}");
         }
         else if (_handler is OfficeCli.Handlers.PowerPointHandler ppt)
         {
@@ -1679,7 +1685,8 @@ public class ResidentServer : IDisposable
         }
         else
         {
-            _handler.Remove(path);
+            var props = req.GetProps();
+            _handler.Remove(path, props.Count > 0 ? props : null);
         }
         Console.WriteLine($"Removed {path}");
     }
@@ -1688,7 +1695,8 @@ public class ResidentServer : IDisposable
     {
         var path = req.GetArg("path", "/");
         var to = req.GetArgOrNull("to");
-        var resultPath = _handler.Move(path, to, BuildInsertPosition(req));
+        var props = req.GetProps();
+        var resultPath = _handler.Move(path, to, BuildInsertPosition(req), props.Count > 0 ? props : null);
         Console.WriteLine($"Moved to {resultPath}");
     }
 

@@ -151,7 +151,7 @@ public partial class WordHandler
         if (props.Description != null) node.Format["description"] = props.Description;
         if (props.Category != null) node.Format["category"] = props.Category;
         if (props.LastModifiedBy != null) node.Format["lastModifiedBy"] = props.LastModifiedBy;
-        if (props.Revision != null) node.Format["revision"] = props.Revision;
+        if (props.Revision != null) node.Format["revisionNumber"] = props.Revision;
         if (props.Created != null) node.Format["created"] = props.Created.Value.ToString("o");
         if (props.Modified != null) node.Format["modified"] = props.Modified.Value.ToString("o");
 
@@ -652,6 +652,48 @@ public partial class WordHandler
             $"Malformed path segment '{part}'. Predicate must be a positive integer, 'last()', or '[@attr=value]'.");
     }
 
+    // PERF: cache the flattened+filtered body paragraph/table lists per Body
+    // instance. /body/p[N] and /body/tbl[N] are resolved by index; without
+    // the cache, dumping a 14k-paragraph doc made 14k Get calls × 14k walks
+    // → O(n²). Invalidation is by-count: any body mutation that adds or
+    // removes a top-level child bumps body.ChildElements.Count and the
+    // cache is rebuilt on next access. Property-only Set calls do not
+    // change the count and don't invalidate (correct — they don't change
+    // which paragraph sits at index N).
+    private readonly Dictionary<OpenXmlElement, (int count, List<OpenXmlElement> paras, List<OpenXmlElement> tables)>
+        _bodyChildIndexCache = new();
+
+    private List<OpenXmlElement> GetBodyParagraphIndex(Body body) => GetBodyChildIndex(body).paras;
+    private List<OpenXmlElement> GetBodyTableIndex(Body body) => GetBodyChildIndex(body).tables;
+
+    private (List<OpenXmlElement> paras, List<OpenXmlElement> tables) GetBodyChildIndex(Body body)
+    {
+        var currentCount = body.ChildElements.Count;
+        if (_bodyChildIndexCache.TryGetValue(body, out var entry) && entry.count == currentCount)
+            return (entry.paras, entry.tables);
+
+        var flat = new List<OpenXmlElement>(body.ChildElements.Count);
+        void Collect(OpenXmlElement el)
+        {
+            foreach (var c in el.ChildElements)
+            {
+                if (c is CustomXmlBlock cx) Collect(cx);
+                else flat.Add(c);
+            }
+        }
+        Collect(body);
+
+        var paras = new List<OpenXmlElement>();
+        var tables = new List<OpenXmlElement>();
+        foreach (var e in flat)
+        {
+            if (e is Paragraph p && !IsOMathParaWrapperParagraph(p)) paras.Add(p);
+            else if (e is Table t) tables.Add(t);
+        }
+        _bodyChildIndexCache[body] = (currentCount, paras, tables);
+        return (paras, tables);
+    }
+
     private OpenXmlElement? NavigateToElement(List<PathSegment> segments)
         => NavigateToElement(segments, out _, out _);
 
@@ -912,21 +954,14 @@ public partial class WordHandler
                 // logic in WalkBodyChild for `get /body`; without this, path
                 // resolution diverged from listing and `get /body/p[1]` threw
                 // "Path not found" on customXml-wrapped paragraphs.
-                var flat = new List<OpenXmlElement>();
-                void CollectBodyChildren(OpenXmlElement el)
-                {
-                    foreach (var c in el.ChildElements)
-                    {
-                        if (c is CustomXmlBlock cx) CollectBodyChildren(cx);
-                        else flat.Add(c);
-                    }
-                }
-                CollectBodyChildren(body2);
+                // PERF: cache the filtered lists per Body instance + child count.
+                // Without the cache, dumping a doc with N body paragraphs costs
+                // O(N²) because the dump emitter calls Get("/body/p[K]") for
+                // every K in 1..N, and each call re-walked body.ChildElements.
+                // Real-world 14k-paragraph doc: 5+ minutes → seconds.
                 children = seg.Name.ToLowerInvariant() == "p"
-                    ? flat.OfType<Paragraph>()
-                        .Where(p => !IsOMathParaWrapperParagraph(p))
-                        .Cast<OpenXmlElement>()
-                    : flat.OfType<Table>().Cast<OpenXmlElement>();
+                    ? GetBodyParagraphIndex(body2)
+                    : GetBodyTableIndex(body2);
             }
             else if (current is Body body3 && seg.Name == "oMathPara")
             {
@@ -953,8 +988,35 @@ public partial class WordHandler
                 children = seg.Name.ToLowerInvariant() switch
                 {
                     "p" => current.Elements<Paragraph>().Cast<OpenXmlElement>(),
+                    // BUG-D1-TXBX-RUN-INDEX: /<para>/r[N] must enumerate the
+                    // SAME runs NodeBuilder surfaces as paragraph children —
+                    // i.e. skip runs that live INSIDE a child textbox
+                    // (their canonical path is /<para>/textbox[N]/p[M]/r[K]).
+                    // Without this filter, a paragraph hosting 3 textbox
+                    // drawings (Card A / B / C side-by-side) resolves r[2] to
+                    // a text run INSIDE Card A's textbox content instead of
+                    // Card B's drawing run, so WordBatchEmitter probes the
+                    // wrong XML, IsTextboxDrawing returns false, and Cards
+                    // B/C silently degrade to plain `add r` rows on dump
+                    // round-trip — losing the textboxes entirely and
+                    // misaligning every subsequent /body/textbox[K] index.
+                    // Mirrors GetAllRuns in WordHandler.Helpers (also skips
+                    // SimpleField/SdtRun-nested runs for the same path-
+                    // stability reason).
                     "r" => current.Descendants<Run>()
                         .Where(r => r.GetFirstChild<CommentReference>() == null)
+                        .Where(r => r.Ancestors<SdtRun>().FirstOrDefault() == null)
+                        .Where(r => r.Ancestors<SimpleField>().FirstOrDefault() == null)
+                        .Where(r =>
+                        {
+                            var tbc = r.Ancestors<TextBoxContent>().FirstOrDefault();
+                            if (tbc == null) return true;
+                            foreach (var anc in tbc.Ancestors())
+                            {
+                                if (ReferenceEquals(anc, current)) return false;
+                            }
+                            return true;
+                        })
                         .Cast<OpenXmlElement>(),
                     "tbl" => current.Elements<Table>().Cast<OpenXmlElement>(),
                     "tr" => current.Elements<TableRow>().Cast<OpenXmlElement>(),
@@ -1117,6 +1179,17 @@ public partial class WordHandler
             // returned path round-trips cleanly and matches Query's canonical form.
             // Style is exempt — /styles/<id> uses the user-supplied styleId/Name as the key.
             var canonName = (next is Style) ? seg.Name : next.LocalName;
+            // BUG-D1-TXBX-PATH: the textbox / shape segments resolve to
+            // wps:wsp + w:txbxContent OOXML elements whose LocalName is
+            // "wsp" / "txbxContent" — neither is navigable as a path
+            // segment (the navigable name is the user-facing "textbox" /
+            // "shape" form handled at the children-selector switch above).
+            // Preserve the user-supplied segment name so resolvedPath stays
+            // re-navigable; without this, descendant Get calls on children
+            // like /<host>/textbox[N]/tbl[K]/tr[J] fail with
+            // "No txbxContent found at /body".
+            if (canonName == "txbxContent" || canonName == "wsp")
+                canonName = seg.Name.ToLowerInvariant();
             if (next is Paragraph navPara && !string.IsNullOrEmpty(navPara.ParagraphId?.Value))
             {
                 parentPath += "/" + canonName + $"[@paraId={navPara.ParagraphId.Value}]";
@@ -1364,11 +1437,32 @@ public partial class WordHandler
             var pPrChange = pProps?.GetFirstChild<ParagraphPropertiesChange>();
             if (pPrChange != null)
             {
-                node.Format["trackChange"] = "format";
+                node.Format["revision.type"] = "format";
                 if (!string.IsNullOrEmpty(pPrChange.Author?.Value))
-                    node.Format["trackChange.author"] = pPrChange.Author!.Value!;
+                    node.Format["revision.author"] = pPrChange.Author!.Value!;
                 if (pPrChange.Date?.Value is DateTime pDate)
-                    node.Format["trackChange.date"] = pDate.ToString("o");
+                    node.Format["revision.date"] = pDate.ToString("o");
+            }
+            // paraMarkIns: `<w:pPr><w:rPr><w:ins .../></w:rPr></w:pPr>` records
+            // that the paragraph mark itself was inserted as a tracked change —
+            // distinct from pPrChange (format-change snapshot) and from any
+            // content-run wrappers. Surfaced under a paraMarkIns.* namespace so
+            // dump can translate it back into AddParagraph's bare-trackChange.*
+            // form on replay (which re-creates both the ¶ mark and any
+            // accompanying content wrapping in one step). Kept distinct from
+            // `trackChange=format` to avoid clobbering pPrChange attribution
+            // when both are present on the same paragraph.
+            var pmrpRev = pProps?.ParagraphMarkRunProperties;
+            if (pmrpRev != null)
+            {
+                var pMarkIns = pmrpRev.GetFirstChild<Inserted>();
+                if (pMarkIns != null)
+                {
+                    if (!string.IsNullOrEmpty(pMarkIns.Author?.Value))
+                        node.Format["paraMarkIns.author"] = pMarkIns.Author!.Value!;
+                    if (pMarkIns.Date?.Value is DateTime piDate)
+                        node.Format["paraMarkIns.date"] = piDate.ToString("o");
+                }
             }
             if (pProps != null)
             {
@@ -1513,7 +1607,7 @@ public partial class WordHandler
                     var numIdVal = numProps.NumberingId.Val.Value;
                     node.Format["numId"] = numIdVal.ToString();
                     var ilvlVal = numProps.NumberingLevelReference?.Val?.Value ?? 0;
-                    node.Format["numLevel"] = ilvlVal.ToString();
+                    node.Format["ilvl"] = ilvlVal.ToString();
                     // numId=0 is the OOXML "remove numbering" sentinel — the paragraph
                     // explicitly opts out of any inherited list style. Skip numFmt /
                     // listStyle / start lookup so Get does not falsely advertise a list.
@@ -1537,7 +1631,7 @@ public partial class WordHandler
                     {
                         var (inhId, inhLvl) = inherited.Value;
                         node.Format["numId"] = inhId.ToString();
-                        node.Format["numLevel"] = inhLvl.ToString();
+                        node.Format["ilvl"] = inhLvl.ToString();
                         // BUG-DUMP26-01: flag style-inherited values so WordBatchEmitter
                         // can suppress them on `add p` — they're already covered by
                         // the paragraph's style and emitting them would semantically
@@ -2033,22 +2127,22 @@ public partial class WordHandler
                     var insAnc = unkRun.Ancestors<InsertedRun>().FirstOrDefault();
                     if (insAnc != null)
                     {
-                        synthNode.Format["trackChange"] = "ins";
+                        synthNode.Format["revision.type"] = "ins";
                         if (!string.IsNullOrEmpty(insAnc.Author?.Value))
-                            synthNode.Format["trackChange.author"] = insAnc.Author!.Value!;
+                            synthNode.Format["revision.author"] = insAnc.Author!.Value!;
                         if (insAnc.Date?.Value is DateTime insAncDate)
-                            synthNode.Format["trackChange.date"] = insAncDate.ToString("o");
+                            synthNode.Format["revision.date"] = insAncDate.ToString("o");
                     }
                     else
                     {
                         var delAnc = unkRun.Ancestors<DeletedRun>().FirstOrDefault();
                         if (delAnc != null)
                         {
-                            synthNode.Format["trackChange"] = "del";
+                            synthNode.Format["revision.type"] = "del";
                             if (!string.IsNullOrEmpty(delAnc.Author?.Value))
-                                synthNode.Format["trackChange.author"] = delAnc.Author!.Value!;
+                                synthNode.Format["revision.author"] = delAnc.Author!.Value!;
                             if (delAnc.Date?.Value is DateTime delAncDate)
-                                synthNode.Format["trackChange.date"] = delAncDate.ToString("o");
+                                synthNode.Format["revision.date"] = delAncDate.ToString("o");
                         }
                     }
                     node.Children.Add(synthNode);
@@ -2185,22 +2279,22 @@ public partial class WordHandler
             var insAncestor = run.Ancestors<InsertedRun>().FirstOrDefault();
             if (insAncestor != null)
             {
-                node.Format["trackChange"] = "ins";
+                node.Format["revision.type"] = "ins";
                 if (!string.IsNullOrEmpty(insAncestor.Author?.Value))
-                    node.Format["trackChange.author"] = insAncestor.Author!.Value!;
+                    node.Format["revision.author"] = insAncestor.Author!.Value!;
                 if (insAncestor.Date?.Value is DateTime insDate)
-                    node.Format["trackChange.date"] = insDate.ToString("o");
+                    node.Format["revision.date"] = insDate.ToString("o");
             }
             else
             {
                 var delAncestor = run.Ancestors<DeletedRun>().FirstOrDefault();
                 if (delAncestor != null)
                 {
-                    node.Format["trackChange"] = "del";
+                    node.Format["revision.type"] = "del";
                     if (!string.IsNullOrEmpty(delAncestor.Author?.Value))
-                        node.Format["trackChange.author"] = delAncestor.Author!.Value!;
+                        node.Format["revision.author"] = delAncestor.Author!.Value!;
                     if (delAncestor.Date?.Value is DateTime delDate)
-                        node.Format["trackChange.date"] = delDate.ToString("o");
+                        node.Format["revision.date"] = delDate.ToString("o");
                 }
                 else
                 {
@@ -2211,11 +2305,11 @@ public partial class WordHandler
                     var rPrChange = run.RunProperties?.GetFirstChild<RunPropertiesChange>();
                     if (rPrChange != null)
                     {
-                        node.Format["trackChange"] = "format";
+                        node.Format["revision.type"] = "format";
                         if (!string.IsNullOrEmpty(rPrChange.Author?.Value))
-                            node.Format["trackChange.author"] = rPrChange.Author!.Value!;
+                            node.Format["revision.author"] = rPrChange.Author!.Value!;
                         if (rPrChange.Date?.Value is DateTime rDate)
-                            node.Format["trackChange.date"] = rDate.ToString("o");
+                            node.Format["revision.date"] = rDate.ToString("o");
                     }
                 }
             }
@@ -2690,6 +2784,20 @@ public partial class WordHandler
             var tp = table.GetFirstChild<TableProperties>();
             if (tp != null)
             {
+                // tblPrChange: `set table + trackChange.author` snapshots the
+                // prior tblPr and stamps author/date. Surfaced under
+                // tblPrChange.* so EmitTable can emit a follow-up
+                // `set /body/tbl[N]` step carrying trackChange.author/date
+                // (re-runs the snapshot+stamp on replay). Distinct namespace
+                // from any future bare `trackChange=` on tables.
+                var tblPrChange = tp.GetFirstChild<TablePropertiesChange>();
+                if (tblPrChange != null)
+                {
+                    if (!string.IsNullOrEmpty(tblPrChange.Author?.Value))
+                        node.Format["tblPrChange.author"] = tblPrChange.Author!.Value!;
+                    if (tblPrChange.Date?.Value is DateTime tDate)
+                        node.Format["tblPrChange.date"] = tDate.ToString("o");
+                }
                 // Table style
                 // BUG-R3-05: empty Val (set via legacy code that wrote tblStyle
                 // with empty string) must NOT surface as a "style" key.
@@ -3297,6 +3405,17 @@ public partial class WordHandler
     {
         var trPr = row.TableRowProperties;
         if (trPr == null) return;
+        // trPrChange: `set row + trackChange.author` snapshots prior trPr.
+        // Surfaced under trPrChange.* for round-trip; EmitTable emits a
+        // follow-up `set tr[N]` with trackChange.author/date to reproduce.
+        var trPrChange = trPr.GetFirstChild<TableRowPropertiesChange>();
+        if (trPrChange != null)
+        {
+            if (!string.IsNullOrEmpty(trPrChange.Author?.Value))
+                node.Format["trPrChange.author"] = trPrChange.Author!.Value!;
+            if (trPrChange.Date?.Value is DateTime trDate)
+                node.Format["trPrChange.date"] = trDate.ToString("o");
+        }
         var rh = trPr.GetFirstChild<TableRowHeight>();
         if (rh?.Val?.Value != null)
         {
@@ -3319,7 +3438,18 @@ public partial class WordHandler
         var tcPr = cell.TableCellProperties;
         if (tcPr != null)
         {
-            // Borders (including diagonal — like POI CTTcBorders)
+            // tcPrChange: `set cell + trackChange.author` snapshots prior tcPr.
+            // Surfaced under tcPrChange.* for round-trip; EmitTable emits a
+            // follow-up `set tr[N]/tc[M]` with trackChange.author/date.
+            var tcPrChange = tcPr.GetFirstChild<TableCellPropertiesChange>();
+            if (tcPrChange != null)
+            {
+                if (!string.IsNullOrEmpty(tcPrChange.Author?.Value))
+                    node.Format["tcPrChange.author"] = tcPrChange.Author!.Value!;
+                if (tcPrChange.Date?.Value is DateTime tcDate)
+                    node.Format["tcPrChange.date"] = tcDate.ToString("o");
+            }
+            // Borders (including diagonal)
             var cb = tcPr.TableCellBorders;
             if (cb != null)
             {

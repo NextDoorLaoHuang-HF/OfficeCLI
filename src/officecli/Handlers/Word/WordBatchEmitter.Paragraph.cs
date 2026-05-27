@@ -38,6 +38,31 @@ public static partial class WordBatchEmitter
         if (TryEmitTextboxOnlyParagraph(word, pNode, parentPath, autoPresent, items, ctx)) return;
 
         var props = FilterEmittableProps(pNode.Format);
+        // paraMarkIns.* → AddParagraph's bare trackChange.author/date form.
+        // A bare trackChange.author (no `trackChange=<kind>` literal) on
+        // `add p` produces both <w:pPr><w:rPr><w:ins/></w:rPr></w:pPr> and
+        // wraps each auto-created content run in <w:ins>. We pass NO `text=`
+        // here so step 1 only stamps the paragraph mark; subsequent `add r`
+        // steps (which already carry their own trackChange=ins) wrap the
+        // content. Guarded against clashing with a sibling pPrChange — if
+        // both surface, paraMarkIns wins (its absence on round-trip is more
+        // visually obvious in Word's revision UI).
+        if (props.Remove("paraMarkIns.author", out var pmiAuthor))
+        {
+            props["revision.author"] = pmiAuthor;
+            // Strip revision.type=format / revision.date from a sibling pPrChange
+            // so the bare-attribution path on AddParagraph fires instead of the
+            // pPrChange path. pPrChange round-trip on paragraphs that are
+            // ALSO newly inserted is a corner case we accept losing for now
+            // (rare in practice; pPrChange semantics overlap with paraMarkIns
+            // on a fresh paragraph anyway).
+            props.Remove("revision.type");
+        }
+        if (props.Remove("paraMarkIns.date", out var pmiDate))
+        {
+            if (!props.ContainsKey("revision.date"))
+                props["revision.date"] = pmiDate;
+        }
         // BUG-DUMP26-01: numId/numLevel that came from style inheritance
         // (ResolveNumPrFromStyle, no direct w:numPr on the paragraph) must
         // not ride on `add p` — the style already supplies them, and emitting
@@ -81,7 +106,11 @@ public static partial class WordBatchEmitter
             .Where(c => c.Type == "run" || c.Type == "r" || c.Type == "picture" || c.Type == "field" || c.Type == "ptab" || c.Type == "break"
                 || c.Type == "equation"
                 || c.Type == "tab"
-                || c.Type == "bookmark")
+                || c.Type == "bookmark"
+                // R10-bug1: include ole children so TryEmitOleRun can fire
+                // a warning instead of letting them be silently filtered
+                // out of the run list (full round-trip is a backlog item).
+                || c.Type == "ole")
             .ToList();
         var breaks = runs.Where(c => c.Type == "break").ToList();
         var bookmarks = (pNode.Children ?? new List<DocumentNode>())
@@ -191,6 +220,22 @@ public static partial class WordBatchEmitter
         // BUG-DUMP6-05: collapse N runs that share a hyperlink wrapper into
         // one synthetic hyperlink-typed entry — see CoalesceHyperlinkRuns.
         runs = CoalesceHyperlinkRuns(runs);
+        // BUG-D1-MULTIDRAWING-HOST: when this paragraph hosts ≥2 drawing-
+        // bearing runs (side-by-side card layout), every textbox must attach
+        // to the SAME host paragraph just emitted by the `add p` above so the
+        // side-by-side relationship survives round-trip. A single drawing
+        // either reached the wrapper-coalesce shortcut (children.Count == 1)
+        // OR shares its source paragraph with sibling text/runs — in the
+        // latter case attaching to the host paragraph is still correct
+        // (preserves the inline relationship that the source had).
+        int drawingBearingCount = runs.Count(r =>
+        {
+            if (r.Type == "picture") return true;
+            if (r.Type != "run" && r.Type != "r") return false;
+            var probe = word.GetElementXml(r.Path);
+            return !string.IsNullOrEmpty(probe) && IsTextboxDrawing(probe);
+        });
+        string? sharedAttachPara = drawingBearingCount >= 2 ? paraTargetPath : null;
         foreach (var run in runs)
         {
             if (TryEmitBookmarkRun(run, paraTargetPath, items, ctx)) continue;
@@ -198,8 +243,19 @@ public static partial class WordBatchEmitter
             if (TryEmitTabRun(run, paraTargetPath, items)) continue;
             if (TryEmitPtabRun(run, paraTargetPath, items)) continue;
             if (TryEmitEquationRun(run, paraTargetPath, items)) continue;
-            if (TryEmitFieldRun(run, paraTargetPath, items)) continue;
-            if (TryEmitPictureRun(word, run, paraTargetPath, parentPath, targetIndex, items, ctx)) continue;
+            if (TryEmitFieldRun(run, paraTargetPath, items, ctx)) continue;
+            // R10-bug1: OLE/embedded-object runs surface as type="ole" (see
+            // CreateOleNode in WordHandler.ImageHelpers.cs). The Add side
+            // requires --prop src=<external file> to recreate the embedded
+            // payload, but the emitted batch has no carrier for that file —
+            // base64-inlining the contentType+bytes the way picture runs do
+            // is a backlog item (needs round-trip on the host part-rel +
+            // VML shape geometry + ProgID + DrawAspect + alt-name; see
+            // bug1 follow-up). Until then, surface a deterministic
+            // warning so the dump envelope flags the silent loss instead
+            // of producing an OLE-stripped paragraph that looks complete.
+            if (TryEmitOleRun(run, paraTargetPath, items, ctx)) continue;
+            if (TryEmitPictureRun(word, run, paraTargetPath, parentPath, targetIndex, items, ctx, sharedAttachPara)) continue;
             if (TryEmitNoteRefRun(run, paraTargetPath, items, ctx)) continue;
             EmitPlainOrHyperlinkRun(run, paraTargetPath, items);
         }
@@ -467,7 +523,7 @@ public static partial class WordBatchEmitter
             || r.Format.ContainsKey("ligatures")
             || r.Format.ContainsKey("numForm")
             || r.Format.ContainsKey("numSpacing")
-            || r.Format.ContainsKey("trackChange")
+            || r.Format.ContainsKey("revision.type")
             || r.Format.ContainsKey("sym")) return false;
         // BUG-FIELD-COLLAPSE: a synthetic field run carries `instruction=…` —
         // collapse would lose the field chain on replay.
@@ -621,7 +677,7 @@ public static partial class WordBatchEmitter
         return true;
     }
 
-    private static bool TryEmitFieldRun(DocumentNode run, string paraTargetPath, List<BatchItem> items)
+    private static bool TryEmitFieldRun(DocumentNode run, string paraTargetPath, List<BatchItem> items, BodyEmitContext? ctx = null)
     {
         // Synthetic field entry from CollapseFieldChains. Format carries
         // `instruction` (raw fldSimple/instrText) and Text holds the cached
@@ -633,6 +689,71 @@ public static partial class WordBatchEmitter
         // (BUG-DUMP9-03 fldSimple-only hyperlinks never surface a hyperlink
         // row, and routing the field there would fail path lookup on replay).
         if (run.Type != "field") return false;
+        // R10-bug7: CollapseFieldChains flagged a nested field (IF/REF with
+        // an inner DATE/PAGE/MERGEFIELD branch). AddField rebuilds a flat
+        // begin/instr/separate/display/end chain and cannot model the
+        // nested branches — emitting an `add field` row here would either
+        // throw (parser sees garbage), drop the inner branches, OR merge
+        // the inner instruction into the outer expression. Backlog item:
+        // teach AddField to accept a tree representation. Until then, the
+        // cheapest correct behavior is to flag the loss in envelope
+        // warnings — same model as the OLE warning above — so callers
+        // don't ship a doc with the IF false-branch silently stripped.
+        // R10-bug8: malformed field (begin without matching end) surfaces as
+        // a synth from CollapseFieldChains with _unmatchedFieldBegin=true.
+        // Same warning model as _nestedField — preserve cached display,
+        // flag the partial instruction in envelope.warnings.
+        if (run.Format.TryGetValue("_unmatchedFieldBegin", out var ufbObj) && ufbObj is bool ufbB && ufbB)
+        {
+            if (ctx != null)
+            {
+                var partialInstr = run.Format.TryGetValue("instruction", out var pIv)
+                    ? pIv?.ToString() ?? "" : "";
+                ctx.Warnings.Add(new DocxUnsupportedWarning(
+                    Element: "field.unmatched_begin",
+                    Path: run.Path,
+                    Reason: $"fldChar(begin) without matching end; partial instruction='{partialInstr}' dropped"));
+            }
+            if (!string.IsNullOrEmpty(run.Text))
+            {
+                items.Add(new BatchItem
+                {
+                    Command = "add",
+                    Parent = paraTargetPath,
+                    Type = "r",
+                    Props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["text"] = run.Text!
+                    }
+                });
+            }
+            return true;
+        }
+        if (run.Format.TryGetValue("_nestedField", out var nfObj) && nfObj is bool nfB && nfB)
+        {
+            if (ctx != null)
+            {
+                ctx.Warnings.Add(new DocxUnsupportedWarning(
+                    Element: "field.nested",
+                    Path: run.Path,
+                    Reason: "nested field (begin inside a field's branch) cannot round-trip through add field; cached display preserved but inner field codes dropped"));
+            }
+            // Still emit the cached display so the paragraph isn't empty.
+            if (!string.IsNullOrEmpty(run.Text))
+            {
+                items.Add(new BatchItem
+                {
+                    Command = "add",
+                    Parent = paraTargetPath,
+                    Type = "r",
+                    Props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["text"] = run.Text!
+                    }
+                });
+            }
+            return true;
+        }
         var instr = run.Format.TryGetValue("instruction", out var iv)
             ? iv?.ToString() ?? "" : "";
         var fieldProps = BuildFieldAddProps(instr, run.Text ?? "");
@@ -713,7 +834,7 @@ public static partial class WordBatchEmitter
         return true;
     }
 
-    private static bool TryEmitPictureRun(WordHandler word, DocumentNode run, string paraTargetPath, string parentPath, int targetIndex, List<BatchItem> items, BodyEmitContext? ctx)
+    private static bool TryEmitPictureRun(WordHandler word, DocumentNode run, string paraTargetPath, string parentPath, int targetIndex, List<BatchItem> items, BodyEmitContext? ctx, string? sharedAttachPara = null)
     {
         // Drawing-bearing runs surface as type="picture" regardless of
         // whether the Drawing wraps an image (Blip) or a chart (c:chart).
@@ -732,7 +853,7 @@ public static partial class WordBatchEmitter
             var probeXml = word.GetElementXml(run.Path);
             if (string.IsNullOrEmpty(probeXml)) return false;
             if (!IsTextboxDrawing(probeXml)) return false;
-            if (TryEmitTextbox(word, run, probeXml, parentPath, items, ctx))
+            if (TryEmitTextbox(word, run, probeXml, parentPath, items, ctx, sharedAttachPara))
                 return true;
             // AlternateContent-wrapped non-textbox shapes (rare) fall back to
             // a raw-set append, mirroring the original drawing-fallback path.
@@ -798,7 +919,7 @@ public static partial class WordBatchEmitter
         var rawXml = word.GetElementXml(run.Path);
         if (!string.IsNullOrEmpty(rawXml) && IsTextboxDrawing(rawXml))
         {
-            if (TryEmitTextbox(word, run, rawXml, parentPath, items, ctx))
+            if (TryEmitTextbox(word, run, rawXml, parentPath, items, ctx, sharedAttachPara))
                 return true;
         }
         if (!string.IsNullOrEmpty(rawXml) &&
@@ -835,7 +956,8 @@ public static partial class WordBatchEmitter
     /// raw drawing XML so the rebuilt textbox keeps its layout.
     /// </summary>
     private static bool TryEmitTextbox(WordHandler word, DocumentNode run, string rawXml,
-                                       string parentPath, List<BatchItem> items, BodyEmitContext? ctx)
+                                       string parentPath, List<BatchItem> items, BodyEmitContext? ctx,
+                                       string? attachParaPath = null)
     {
         if (ctx == null) return false;
 
@@ -844,6 +966,15 @@ public static partial class WordBatchEmitter
         // Other parents fall through to the raw-set append.
         string hostPath = parentPath;
         if (!IsTextboxHostPath(hostPath)) return false;
+
+        // BUG-D1-MULTIDRAWING-HOST: when N textboxes share a source
+        // paragraph (side-by-side card layout), attach each to the same
+        // already-emitted host paragraph (attachParaPath = /body/p[last()])
+        // instead of /body — otherwise AddTextbox creates a fresh host per
+        // textbox and the side-by-side layout fans out into N stacked
+        // paragraphs. The textbox INDEX still scopes to hostPath so
+        // /body/textbox[K] addressing remains continuous across the doc.
+        string emitParent = attachParaPath ?? hostPath;
 
         // Allocate next 1-based textbox index for this host.
         int n = ctx.TextboxCounters.TryGetValue(hostPath, out var prev) ? prev + 1 : 1;
@@ -901,7 +1032,7 @@ public static partial class WordBatchEmitter
         items.Add(new BatchItem
         {
             Command = "add",
-            Parent = hostPath,
+            Parent = emitParent,
             Type = "textbox",
             Props = props.Count > 0 ? props : null
         });
@@ -915,6 +1046,7 @@ public static partial class WordBatchEmitter
             var txbxNode = word.Get(textboxPath);
             var children = txbxNode.Children ?? new List<DocumentNode>();
             int innerPIdx = 0;
+            int innerTblIdx = 0;
             bool firstParaSeen = false;
             foreach (var child in children)
             {
@@ -930,6 +1062,19 @@ public static partial class WordBatchEmitter
                     EmitParagraph(word, sourceParaPath, textboxPath, innerPIdx, items,
                                   autoPresent: !firstParaSeen, ctx);
                     firstParaSeen = true;
+                }
+                else if (child.Type == "table" || child.Type == "tbl")
+                {
+                    // BUG-D1-TXBX-TABLE: tables nested INSIDE a textbox were
+                    // silently dropped on dump — the children loop only
+                    // recognised paragraph types. Reuse EmitTable with the
+                    // textbox path as containerPath so the resulting
+                    // `add table` rows target /body/textbox[N]/tbl[K]
+                    // (AddTable already accepts a TextBoxContent parent).
+                    innerTblIdx++;
+                    var sourceTblPath = $"{textboxPath}/tbl[{innerTblIdx}]";
+                    EmitTable(word, sourceTblPath, innerTblIdx, items, ctx,
+                              parentTablePath: null, containerPath: textboxPath);
                 }
             }
         }
@@ -957,6 +1102,43 @@ public static partial class WordBatchEmitter
         if (parentPath.Contains("/tc[", StringComparison.Ordinal)
             && parentPath.EndsWith("]", StringComparison.Ordinal)) return true;
         return false;
+    }
+
+    /// <summary>
+    /// R10-bug1: detect OLE / embedded-object runs (Type=="ole") and emit
+    /// a warning into <see cref="BodyEmitContext.Warnings"/> instead of
+    /// silently dropping the run.
+    ///
+    /// Full round-trip would require carrying the embedded payload
+    /// (Excel/.docx/.pptx/etc binary) plus the VML icon image plus VML
+    /// shape geometry plus ProgID plus DrawAspect plus alt-name through
+    /// the batch stream — picture-run-style base64 inlining is the
+    /// reasonable model but the Add side currently only accepts
+    /// `--prop src=<file>` (real on-disk path) for OLE. Until that gap
+    /// closes, the warning surface is the right call: the host paragraph
+    /// still emits (so the surrounding text is intact), only the OLE
+    /// child is omitted, and the dump envelope's `warnings` array names
+    /// the affected path so the caller can decide whether to bail.
+    /// </summary>
+    private static bool TryEmitOleRun(DocumentNode run, string paraTargetPath, List<BatchItem> items, BodyEmitContext? ctx)
+    {
+        if (run.Type != "ole") return false;
+        if (ctx != null)
+        {
+            // Surface ProgID when available — it's the most useful single
+            // identifier for the caller (Excel.Sheet.12, Word.Document.12,
+            // Package, …) and lets them grep the source for the original
+            // embedded file.
+            var progId = run.Format.TryGetValue("progId", out var pid) ? pid?.ToString() : null;
+            var reason = progId != null
+                ? $"ole run dropped (progId={progId}); add-side requires --prop src=<external file> and the batch stream has no carrier for the embedded payload"
+                : "ole run dropped; add-side requires --prop src=<external file> and the batch stream has no carrier for the embedded payload";
+            ctx.Warnings.Add(new DocxUnsupportedWarning(
+                Element: "ole",
+                Path: run.Path,
+                Reason: reason));
+        }
+        return true;
     }
 
     private static bool TryEmitNoteRefRun(DocumentNode run, string paraTargetPath, List<BatchItem> items, BodyEmitContext? ctx)

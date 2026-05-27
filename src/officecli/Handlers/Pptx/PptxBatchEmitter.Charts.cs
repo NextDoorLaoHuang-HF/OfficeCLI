@@ -142,7 +142,15 @@ public static partial class PptxBatchEmitter
                     "marker", "markerSize", "smooth", "outlineColor",
                     "outlineWidth", "outlineDash", "transparency", "gradient",
                     "trendline", "trendline.dispRSqr", "trendline.dispEq",
-                    "errbars" })
+                    "errbars",
+                    // R38: per-series labelFont dotted sub-keys — Reader now
+                    // emits these on each series node, so the per-series
+                    // flatten must promote them to series{N}.labelFont.* on
+                    // the chart add row. Without it dump→replay loses the
+                    // series-scoped label font (chart-level fan-out is the
+                    // only path that round-trips today).
+                    "labelFont.color", "labelFont.size", "labelFont.bold",
+                    "labelFont.name" })
                 {
                     if (s.Format.TryGetValue(key, out var val) && val != null)
                     {
@@ -166,6 +174,22 @@ public static partial class PptxBatchEmitter
                         props[$"series{seriesIdx}.{key}"] = sval;
                         if (key == "trendline") anySeriesTrendline = true;
                     }
+                }
+                // R38: per-point sub-keys (point{M}.color, point{M}.explosion,
+                // point{M}.marker, …) are emitted by Reader onto each series
+                // node but the allowlist above only enumerates fixed keys.
+                // Iterate the series Format dictionary and promote anything
+                // matching `point\d+\.` to series{N}.point{M}.{prop} on the
+                // chart add row so dump→replay preserves per-data-point
+                // styling.
+                foreach (var (pk, pv) in s.Format)
+                {
+                    if (pv == null) continue;
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(
+                            pk, @"^point\d+\.")) continue;
+                    var psval = pv.ToString();
+                    if (string.IsNullOrEmpty(psval)) continue;
+                    props[$"series{seriesIdx}.{pk}"] = psval;
                 }
             }
             // Chart-level `trendline` is Reader's first-series summary — once
