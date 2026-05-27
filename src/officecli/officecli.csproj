@@ -10,6 +10,9 @@
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <PublishTrimmed>true</PublishTrimmed>
+    <!-- NamedPipeClientStream / NamedPipeServerStream in
+         ResidentServer / ResidentClient / WatchServer / WatchNotifier -->
+    <TrimmerRootAssembly Include="System.IO.Pipes" />
     <CETCompat>false</CETCompat>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
