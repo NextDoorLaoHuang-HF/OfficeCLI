@@ -184,9 +184,16 @@ internal static class AionuiInstaller
                 root["assistants"] = assistants;
             }
 
-            // Check if already registered
+            // Check if already registered — use _setupBy marker for deterministic match
+            // (more robust than name-only matching which can fail on encoding edge cases)
             var existing = assistants.FirstOrDefault(a =>
-                a?["name"]?.GetValue<string>() == "Word 修订助手");
+                a?["_setupBy"]?.GetValue<string>() == "officecli");
+            if (existing == null)
+            {
+                // Fallback: name-based check for manually created assistants
+                existing = assistants.FirstOrDefault(a =>
+                    a?["name"]?.ToString() == "Word 修订助手");
+            }
             if (existing != null && !force)
             {
                 Console.WriteLine($"  ✓ Assistant already registered: Word 修订助手 (id: {existing["id"]})");
@@ -212,6 +219,7 @@ internal static class AionuiInstaller
                 ["enabled"] = true,
                 ["enabledSkills"] = new JsonArray("officecli-docx", "officecli-track-changes"),
                 ["customSkillNames"] = new JsonArray(),
+                ["_setupBy"] = "officecli",
             };
 
             if (dryRun)
