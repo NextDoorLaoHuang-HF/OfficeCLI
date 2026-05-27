@@ -10,9 +10,6 @@
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <PublishTrimmed>true</PublishTrimmed>
-    <!-- NamedPipeClientStream / NamedPipeServerStream in
-         ResidentServer / ResidentClient / WatchServer / WatchNotifier -->
-    <TrimmerRootAssembly Include="System.IO.Pipes" />
     <CETCompat>false</CETCompat>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -54,6 +51,13 @@
        required (single-file installer ships only the .exe). -->
   <ItemGroup>
     <EmbeddedResource Include="..\..\schemas\help\**\*.json" LogicalName="schemas/help/%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- Preserve System.IO.Pipes from IL trimming: ResidentServer,
+       ResidentClient, WatchServer, WatchNotifier all use
+       NamedPipeClientStream / NamedPipeServerStream. -->
+  <ItemGroup>
+    <TrimmerRootAssembly Include="System.IO.Pipes" />
   </ItemGroup>
 
 </Project>
