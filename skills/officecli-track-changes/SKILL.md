@@ -89,7 +89,22 @@ officecli query "$FILE" revision          # list all revisions
 officecli query "$FILE" revision --json   # JSON output
 ```
 
-**Do NOT use `view html` in AionUI** — AionUI already has a live preview via `officecli watch`. Use `query revision` to verify.
+## Preview after modifications
+
+After completing revisions, **show the user a visual preview** so they can see revision marks rendered (red strikethrough, green underline, yellow highlight). Choose the right method for your environment:
+
+**If your client supports displaying web pages** (browser tool, webview, iframe):
+```bash
+officecli view "$FILE" html -o /tmp/preview.html
+# Then open /tmp/preview.html in your client's browser tool
+```
+
+**If the user is in AionUI**, the preview panel already shows live updates via `officecli watch` — no action needed. **Do NOT call `view html` in AionUI** (redundant — opens a second tab).
+
+**If the user is in a CLI-only environment**, fall back to text summary:
+```bash
+officecli query "$FILE" revision          # show revision list as text
+```
 
 ## Contract review pattern
 
