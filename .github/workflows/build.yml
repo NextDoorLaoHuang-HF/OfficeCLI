@@ -6,6 +6,9 @@ on:
     tags:
       - 'v*'
 
+env:
+  OFFICECLI_SKIP_UPDATE: '1'
+
 permissions:
   contents: read
 

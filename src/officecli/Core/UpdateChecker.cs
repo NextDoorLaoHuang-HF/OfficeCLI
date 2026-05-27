@@ -27,7 +27,7 @@ internal static class UpdateChecker
     internal static string ConfigDir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".officecli");
     private static string ConfigPath => Path.Combine(ConfigDir, "config.json");
-    private const string GitHubRepo = "iOfficeAI/OfficeCLI";
+    private const string GitHubRepo = "NextDoorLaoHuang-HF/OfficeCLI";
     // PrimaryBase is the project-controlled mirror (Cloudflare-fronted nginx on
     // a VPS that periodically syncs github releases). FallbackBase is the
     // upstream of last resort. Order matters: the mirror is exercised on every
