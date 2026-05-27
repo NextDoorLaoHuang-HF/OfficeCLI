@@ -84,7 +84,7 @@ curl -fsSL https://officecli.ai/SKILL.md
 
 **方式 A — 图形界面：** 安装 [**AionUi**](https://github.com/iOfficeAI/AionUi) — 一款桌面应用，用自然语言就能创建和编辑 Office 文档，底层由 OfficeCLI 驱动。只需描述你想要什么，AionUi 帮你搞定。
 
-**方式 B — 命令行：** 从源码构建（见下方[安装](#安装)），然后运行：
+**方式 B — 命令行：** 从 [GitHub Releases](https://github.com/NextDoorLaoHuang-HF/OfficeCLI/releases) 下载对应平台的二进制文件，然后运行：
 
 ```bash
 officecli install

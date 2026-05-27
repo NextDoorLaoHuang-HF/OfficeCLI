@@ -89,7 +89,7 @@ That's it. The skill file teaches the agent how to install the binary and use al
 
 **Option A — GUI:** Install [**AionUi**](https://github.com/iOfficeAI/AionUi) — a desktop app that lets you create and edit Office documents through natural language, powered by OfficeCLI under the hood. Just describe what you want, and AionUi handles the rest.
 
-**Option B — CLI:** Build from source (see [Installation](#installation) below), then run:
+**Option B — CLI:** Download the binary for your platform from [GitHub Releases](https://github.com/NextDoorLaoHuang-HF/OfficeCLI/releases), then run:
 
 ```bash
 officecli install
@@ -108,7 +108,11 @@ This installs the `officecli-track-changes` skill and registers the **Word 修�
 ## For Developers — See It Live in 30 Seconds
 
 ```bash
-# 1. Build and install (macOS / Linux)
+# Option 1: Download binary from Releases
+curl -LO https://github.com/NextDoorLaoHuang-HF/OfficeCLI/releases/latest/download/officecli-mac-arm64
+chmod +x officecli-mac-arm64 && sudo cp officecli-mac-arm64 /usr/local/bin/officecli
+
+# Option 2: Build from source
 git clone https://github.com/NextDoorLaoHuang-HF/OfficeCLI.git && cd OfficeCLI
 dotnet publish src/officecli/officecli.csproj -c Release -r osx-arm64 --self-contained -o out
 sudo cp out/officecli /usr/local/bin/
@@ -220,7 +224,23 @@ officecli add deck.pptx / --type slide --prop title="Q4 Report"
 
 ## Installation
 
-This fork does not publish its own releases. Build from source:
+**Download prebuilt binaries** from [GitHub Releases](https://github.com/NextDoorLaoHuang-HF/OfficeCLI/releases):
+
+| Platform | Binary |
+|----------|--------|
+| macOS Apple Silicon | `officecli-mac-arm64` |
+| macOS Intel | `officecli-mac-x64` |
+| Linux x64 | `officecli-linux-x64` |
+| Linux ARM64 | `officecli-linux-arm64` |
+| Windows x64 | `officecli-win-x64.exe` |
+
+```bash
+# macOS example
+chmod +x officecli-mac-arm64 && sudo cp officecli-mac-arm64 /usr/local/bin/officecli
+officecli --version
+```
+
+**Or build from source:**
 
 **Prerequisites:**
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
@@ -232,11 +252,9 @@ dotnet publish src/officecli/officecli.csproj -c Release -r osx-arm64 --self-con
 sudo cp out/officecli /usr/local/bin/
 ```
 
-**Other platforms:** replace `osx-arm64` with `osx-x64`, `linux-x64`, `linux-arm64`, `win-x64`, or `win-arm64`.
+**Other RIDs:** replace `osx-arm64` with `osx-x64`, `linux-x64`, `linux-arm64`, `win-x64`, or `win-arm64`.
 
 Verify installation: `officecli --version`
-
-> **Tip:** For the original upstream release with prebuilt binaries, see [iOfficeAI/OfficeCLI](https://github.com/iOfficeAI/OfficeCLI#installation).
 
 ## Key Features
 

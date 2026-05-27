@@ -4,19 +4,33 @@
 
 ## Quick start (if user asked you to install this project)
 
+**Option 1 — Download prebuilt binary (preferred):**
+
+1. Go to [GitHub Releases](https://github.com/NextDoorLaoHuang-HF/OfficeCLI/releases)
+2. Download the binary for the user's platform (`officecli-mac-arm64`, `officecli-linux-x64`, `officecli-win-x64.exe`, etc.)
+3. Install to PATH:
+
 ```bash
-# 1. Build from source
+# macOS
+chmod +x officecli-mac-arm64 && sudo cp officecli-mac-arm64 /usr/local/bin/officecli
+
+# Linux
+chmod +x officecli-linux-x64 && sudo cp officecli-linux-x64 /usr/local/bin/officecli
+
+# Windows (PowerShell, Admin)
+cp officecli-win-x64.exe C:\Windows\System32\officecli.exe
+```
+
+**Option 2 — Build from source (requires .NET 10 SDK):**
+
+```bash
 git clone https://github.com/NextDoorLaoHuang-HF/OfficeCLI.git && cd OfficeCLI
 dotnet publish src/officecli/officecli.csproj -c Release -r osx-arm64 --self-contained -o out
-# Other platforms: replace osx-arm64 with osx-x64, linux-x64, linux-arm64, win-x64, or win-arm64
-
-# 2. Install to PATH
-sudo cp out/officecli /usr/local/bin/   # macOS/Linux
-# or: copy out/officecli.exe %LOCALAPPDATA%\OfficeCli\   (Windows)
-
-# 3. Verify
-officecli --version
+# Other RIDs: osx-x64, linux-x64, linux-arm64, win-x64, win-arm64
+sudo cp out/officecli /usr/local/bin/
 ```
+
+Verify: `officecli --version`
 
 ## Install skills to AI agents
 
