@@ -425,7 +425,34 @@ officecli view "$FILE" html                    # visual check: green=inserted, r
 officecli close "$FILE"
 ```
 
-**CRITICAL**: When user mentions "修订模式", "审查", "Track Changes", "redline", "revision", you MUST use `--prop trackChange=ins/del/format`. Never fall back to python-docx, docx.js, unpack/pack, or raw XML for revision marks.
+**CRITICAL**: When user mentions "修订模式", "审查", "Track Changes", "redline", "revision", you MUST use `--prop revision.type=ins/del/format`. Never fall back to python-docx, docx.js, unpack/pack, or raw XML for revision marks.
+
+### Hermes WebUI MEDIA Preview (Delivering Reviewed Documents)
+
+When running under **Hermes Agent + Hermes WebUI**, use this workflow to deliver
+revision-tracked contracts with in-chat HTML preview:
+
+```bash
+# 1. Apply revisions with find+replace (preferred over bare add run)
+officecli set "$FILE" /body --prop find="old text" --prop replace="new text" --prop revision.author="甲方"
+
+# 2. Add new clauses as paragraphs
+officecli add "$FILE" /body --type paragraph \
+  --after '/body/p[@paraId=ANCHOR]' --prop text="7.4 New clause..."
+
+# 3. Generate HTML preview
+officecli close "$FILE" 2>/dev/null
+officecli view "$FILE" html 2>/dev/null > "$WORKSPACE/审查预览.html"
+
+# 4. Reference in chat with MEDIA link
+#    MEDIA:/absolute/path/to/审查预览.html
+```
+
+**Key rules for WebUI delivery:**
+- Use `MEDIA:/path/file.html` in chat for inline HTML preview — revision marks render as red strikethrough (del) + green underline (ins)
+- New clauses MUST use `add paragraph` (NOT body-level `<w:ins>` injection via `raw-set`) — body-level ins wrappers are invisible in `view html`
+- HTML files saved to workspace via `terminal` (cp/redirect) won't appear in Artifacts tab, but MEDIA links work reliably
+- Relative links inside HTML won't resolve in WebUI sandbox — don't use `<a href="...">` buttons
 
 ---
 
